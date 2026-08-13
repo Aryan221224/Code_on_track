@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('grbl', {
     // ========== Commands ==========
     send: (c) => ipcRenderer.invoke('grbl:send', c),
     runGCode: (g) => ipcRenderer.invoke('grbl:runGCode', g),
+    runGCodeAligned: (g) => ipcRenderer.invoke('grbl:runGCodeAligned', g),
     stop: () => ipcRenderer.invoke('grbl:stop'),
 
     // ========== Laser Control ==========
@@ -114,4 +115,14 @@ contextBridge.exposeInMainWorld('api', {
     // Engraving operations
     updateItemStatus: (uid, status) => ipcRenderer.invoke('api:updateItemStatus', { uid, status }),
     recordEngraving: (data) => ipcRenderer.invoke('api:recordEngraving', data)
+});
+
+// Vision Alignment (see VISION_ALIGNMENT.md) -- camera-based workpiece
+// position/rotation detection, applied to G-code via grbl.runGCodeAligned.
+contextBridge.exposeInMainWorld('vision', {
+    calibrate: (cameraIndex) => ipcRenderer.invoke('vision:calibrate', { cameraIndex }),
+    align: (opts) => ipcRenderer.invoke('vision:align', opts || {}),
+    getLastAlignment: () => ipcRenderer.invoke('vision:getLastAlignment'),
+    clearAlignment: () => ipcRenderer.invoke('vision:clearAlignment'),
+    pullFromPhone: (maxAgeSeconds) => ipcRenderer.invoke('vision:pullFromPhone', { maxAgeSeconds })
 });

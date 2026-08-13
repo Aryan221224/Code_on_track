@@ -967,3 +967,40 @@ input[type="number"] {
   outline: none;
   border-color: var(--accent);
 }
+
+/* Vision Alignment (see VISION_ALIGNMENT.md) */
+.vision-status {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-family: 'Courier New', monospace;
+  color: var(--text);
+}
+
+.vision-status.ok {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.vision-status.warn {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.vision-status.error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}

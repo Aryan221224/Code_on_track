@@ -892,12 +892,106 @@ $('generateBtn').addEventListener('click', async () => {
   log(`G-Code generated: ${numLines} lines, ${sizeW}x${sizeH}mm @ ${engravingSpeed}mm/min`);
 });
 
+// ========== Vision Alignment (see VISION_ALIGNMENT.md) ==========
+function setVisionStatus(text, level) {
+  const el = $('visionStatus');
+  el.textContent = text;
+  el.className = 'vision-status' + (level ? ' ' + level : '');
+}
+
+$('visionCalibrateBtn').addEventListener('click', async () => {
+  $('visionCalibrateBtn').disabled = true;
+  $('visionAlignBtn').disabled = true;
+  $('visionApplyAlignment').checked = false;
+  $('visionApplyAlignment').disabled = true;
+  setVisionStatus('Calibrating (capturing bed markers)...', 'warn');
+  try {
+    const result = await window.vision.calibrate();
+    if (result.success) {
+      const err = result.report.reprojection_error_mm.max;
+      setVisionStatus(`Calibrated - reprojection error ${err.toFixed(3)}mm`, err > 1.0 ? 'warn' : 'ok');
+      $('visionAlignBtn').disabled = false;
+      log(`Vision: camera calibrated (${err.toFixed(3)}mm max reprojection error)`);
+    } else {
+      setVisionStatus(`Calibration failed: ${result.error}`, 'error');
+      log(`Vision: calibration failed - ${result.error}`, 'error');
+    }
+  } catch (e) {
+    setVisionStatus(`Calibration error: ${e.message}`, 'error');
+    log(`Vision: calibration error - ${e.message}`, 'error');
+  } finally {
+    $('visionCalibrateBtn').disabled = false;
+  }
+});
+
+$('visionAlignBtn').addEventListener('click', async () => {
+  $('visionAlignBtn').disabled = true;
+  $('visionApplyAlignment').checked = false;
+  $('visionApplyAlignment').disabled = true;
+  setVisionStatus('Reading workpiece position...', 'warn');
+  try {
+    const result = await window.vision.align();
+    if (result.success) {
+      setVisionStatus(
+        `dx=${result.dx_mm.toFixed(2)}mm dy=${result.dy_mm.toFixed(2)}mm `
+        + `dθ=${result.theta_deg.toFixed(2)}° (confidence ${(result.confidence * 100).toFixed(0)}%)`,
+        'ok');
+      $('visionApplyAlignment').disabled = false;
+      log(`Vision: alignment read - dx=${result.dx_mm}mm dy=${result.dy_mm}mm dtheta=${result.theta_deg}deg`);
+    } else {
+      setVisionStatus(`Alignment failed: ${result.error}`, 'error');
+      log(`Vision: alignment failed - ${result.error}`, 'error');
+    }
+  } catch (e) {
+    setVisionStatus(`Alignment error: ${e.message}`, 'error');
+    log(`Vision: alignment error - ${e.message}`, 'error');
+  } finally {
+    $('visionAlignBtn').disabled = false;
+  }
+});
+
+$('visionPullPhoneBtn').addEventListener('click', async () => {
+  $('visionPullPhoneBtn').disabled = true;
+  $('visionApplyAlignment').checked = false;
+  $('visionApplyAlignment').disabled = true;
+  setVisionStatus('Checking for a phone reading...', 'warn');
+  try {
+    const result = await window.vision.pullFromPhone();
+    if (result.success) {
+      const ageStr = result.age_seconds !== undefined ? ` (${Math.round(result.age_seconds)}s old)` : '';
+      setVisionStatus(
+        `From phone${ageStr}: dx=${result.dx_mm.toFixed(2)}mm dy=${result.dy_mm.toFixed(2)}mm `
+        + `dθ=${result.theta_deg.toFixed(2)}° (confidence ${(result.confidence * 100).toFixed(0)}%)`,
+        'ok');
+      $('visionApplyAlignment').disabled = false;
+      log(`Vision: pulled phone alignment - dx=${result.dx_mm}mm dy=${result.dy_mm}mm dtheta=${result.theta_deg}deg`
+        + (result.item_uid ? ` (item ${result.item_uid})` : ''));
+    } else {
+      setVisionStatus(`No phone reading: ${result.error}`, 'error');
+      log(`Vision: phone reading unavailable - ${result.error}`, 'error');
+    }
+  } catch (e) {
+    setVisionStatus(`Phone reading error: ${e.message}`, 'error');
+    log(`Vision: phone reading error - ${e.message}`, 'error');
+  } finally {
+    $('visionPullPhoneBtn').disabled = false;
+  }
+});
+
 $('startBtn').addEventListener('click', async () => {
   if (!currentGCode) return;
-  log('Starting...');
   $('stopBtn').disabled = false;
   $('progressBox').hidden = false;
-  await window.grbl.runGCode(currentGCode);
+  if ($('visionApplyAlignment').checked) {
+    log('Starting with vision alignment applied...');
+    const result = await window.grbl.runGCodeAligned(currentGCode);
+    if (!result.success) {
+      log(`Aligned run failed: ${result.error}`, 'error');
+    }
+  } else {
+    log('Starting...');
+    await window.grbl.runGCode(currentGCode);
+  }
   $('stopBtn').disabled = true;
 });
 

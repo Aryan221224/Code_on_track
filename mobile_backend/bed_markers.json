@@ -1,0 +1,11 @@
+{
+  "_comment": "Machine-mm (X,Y) position of the CENTER of each fixed ArUco calibration marker glued to the bed corners. Edit these four to match your actual machine after printing/sticking the markers -- see VISION_ALIGNMENT.md step 2. Default layout assumes a 250x250mm bed (MACHINE_CALIBRATION_GUIDE.md) with markers 15mm in from each corner; adjust workAreaX/workAreaY-based values to your machine.",
+  "dictionary": "DICT_4X4_50",
+  "marker_size_mm": 20,
+  "markers": {
+    "0": [15, 15],
+    "1": [235, 15],
+    "2": [235, 235],
+    "3": [15, 235]
+  }
+}

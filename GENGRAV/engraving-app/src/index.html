@@ -154,6 +154,23 @@
           </div>
         </section>
 
+        <!-- Vision Alignment (see VISION_ALIGNMENT.md) -->
+        <section class="section">
+          <h2>📷 Vision Alignment</h2>
+          <div class="row">
+            <button id="visionCalibrateBtn" class="btn sm">Calibrate Camera</button>
+            <button id="visionAlignBtn" class="btn sm" disabled title="Calibrate first">Align Workpiece</button>
+          </div>
+          <div class="row">
+            <button id="visionPullPhoneBtn" class="btn sm" title="Pick up the latest reading from the phone app's Vision Alignment page">📱 Use Phone Reading</button>
+          </div>
+          <div id="visionStatus" class="vision-status">Not calibrated</div>
+          <label class="checkbox-row" title="When checked, Start Engraving applies the last camera alignment reading to the G-code before sending it">
+            <input type="checkbox" id="visionApplyAlignment" disabled>
+            Apply alignment to next job
+          </label>
+        </section>
+
         <!-- Emergency -->
         <section class="section">
           <button id="emergencyBtn" class="btn emergency">⚠️ EMERGENCY STOP</button>

@@ -15,6 +15,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
 import io
+import json
 from PIL import Image
 import numpy as np
 import base64
@@ -26,6 +27,17 @@ try:
 except ImportError:
     PIPELINE_AVAILABLE = False
     print("⚠️ Pipeline module not available")
+
+# Import camera-based workpiece vision alignment (see VISION_ALIGNMENT.md).
+# Same vision_lib.py used by the desktop app's USB-camera path (GENGRAV/vision) --
+# copied here rather than imported cross-package so this backend has no
+# runtime dependency on the Electron app's folder layout.
+try:
+    import vision_lib
+    VISION_AVAILABLE = True
+except ImportError as e:
+    VISION_AVAILABLE = False
+    print(f"⚠️ Vision module not available: {e}")
 
 # Database setup
 DATABASE_URL = os.getenv(
@@ -136,6 +148,42 @@ class Inspection(Base):
     # ai_classification = Column(String(50))  # AI predicted defect class
     # ai_confidence = Column(Float)  # AI confidence score
     inspected_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Database Models for Vision Alignment (see VISION_ALIGNMENT.md)
+class VisionCalibration(Base):
+    """Camera<->bed homography, computed from a photo of the 4 fixed ArUco
+    bed markers. Stored per machine_id (not on local disk, unlike the
+    desktop app's calibration.json) because this backend is intended to run
+    on Render, which has no persistent local filesystem across deploys."""
+    __tablename__ = "vision_calibrations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    machine_id = Column(String(100), nullable=False, index=True, default="default")
+    homography_json = Column(Text, nullable=False)     # 3x3 matrix, JSON-encoded
+    reprojection_error_mm = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class VisionAlignment(Base):
+    """A single alignment reading (from a phone or, in principle, any other
+    capture device hitting this same endpoint), persisted so the desktop
+    app can poll for it -- see engraving-app/src/main.js's
+    vision:pullFromPhone handler. A phone has no serial port to drive GRBL
+    itself, so this table is the hand-off point between 'a phone took a
+    photo' and 'the machine actually applies the correction'."""
+    __tablename__ = "vision_alignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    machine_id = Column(String(100), nullable=False, index=True, default="default")
+    item_uid = Column(String(100), index=True)
+    dx_mm = Column(Float, nullable=False)
+    dy_mm = Column(Float, nullable=False)
+    theta_deg = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+    nominal_x = Column(Float)
+    nominal_y = Column(Float)
+    nominal_theta = Column(Float)
+    source = Column(String(20), default="phone")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Create tables if they don't exist
@@ -741,6 +789,171 @@ async def get_pipeline_status():
             "available": False,
             "error": str(e)
         }
+
+# ============================================================================
+# CAMERA-BASED WORKPIECE VISION ALIGNMENT (see VISION_ALIGNMENT.md)
+#
+# Lets a phone's camera stand in for the desktop app's fixed USB webcam.
+# Same vision_lib.py core (ArUco homography calibration + contour-based
+# workpiece detection) either way -- only the capture device and the
+# transport (HTTP+base64 here, direct OpenCV VideoCapture on desktop)
+# differ. A phone can't drive GRBL itself, so /api/vision/align both
+# returns the reading to the phone AND persists it, so the desktop app can
+# poll /api/vision/latest-alignment and apply it to the G-code.
+# ============================================================================
+MIN_VISION_CONFIDENCE = 0.5
+
+class VisionCalibrateRequest(BaseModel):
+    image_base64: str
+    machine_id: str = "default"
+
+class VisionCalibrateResponse(BaseModel):
+    success: bool
+    reprojection_error_mm: Optional[Dict[str, float]] = None
+    markers_used: Optional[list] = None
+    error: Optional[str] = None
+
+class VisionAlignRequest(BaseModel):
+    image_base64: str
+    machine_id: str = "default"
+    item_uid: Optional[str] = None
+    nominal_x: Optional[float] = None
+    nominal_y: Optional[float] = None
+    nominal_theta: float = 0.0
+
+class VisionAlignResponse(BaseModel):
+    success: bool
+    dx_mm: Optional[float] = None
+    dy_mm: Optional[float] = None
+    theta_deg: Optional[float] = None
+    confidence: Optional[float] = None
+    error: Optional[str] = None
+
+def _decode_image_bgr(image_base64: str):
+    """base64 (as sent by the Flutter app, same convention as
+    DefectClassificationRequest elsewhere in this file) -> OpenCV BGR array."""
+    image_data = base64.b64decode(image_base64)
+    pil_image = Image.open(io.BytesIO(image_data)).convert("RGB")
+    rgb = np.array(pil_image)
+    return np.ascontiguousarray(rgb[:, :, ::-1])  # RGB -> BGR for OpenCV/vision_lib
+
+@app.post("/api/vision/calibrate", response_model=VisionCalibrateResponse)
+def vision_calibrate(request: VisionCalibrateRequest):
+    """Calibrate the camera<->bed homography from a photo of the 4 fixed
+    ArUco bed markers -- works from a phone photo exactly like the desktop
+    USB-camera path (vision/calibrate.py), same vision_lib.py underneath.
+    Persisted per machine_id so a later /align call (from the phone or the
+    desktop) can reuse it without recalibrating."""
+    if not VISION_AVAILABLE:
+        raise HTTPException(status_code=503, detail="vision module not available on this deployment")
+    try:
+        image = _decode_image_bgr(request.image_base64)
+        H, report = vision_lib.calibrate_from_image(image)
+        db = SessionLocal()
+        try:
+            db.add(VisionCalibration(
+                machine_id=request.machine_id,
+                homography_json=json.dumps(H.tolist()),
+                reprojection_error_mm=report["reprojection_error_mm"]["max"],
+            ))
+            db.commit()
+        finally:
+            db.close()
+        return VisionCalibrateResponse(success=True, reprojection_error_mm=report["reprojection_error_mm"],
+                                        markers_used=report["markers_used"])
+    except vision_lib.VisionError as e:
+        return VisionCalibrateResponse(success=False, error=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Calibration failed: {str(e)}")
+
+@app.post("/api/vision/align", response_model=VisionAlignResponse)
+def vision_align(request: VisionAlignRequest):
+    """Read the workpiece alignment offset from a phone photo, against the
+    most recent calibration saved for this machine_id. Always persists the
+    attempt's reading (even a low-confidence one) for visibility, but only
+    reports success when it clears MIN_VISION_CONFIDENCE -- a caller must
+    never be handed a reading it didn't ask to be told was unreliable."""
+    if not VISION_AVAILABLE:
+        raise HTTPException(status_code=503, detail="vision module not available on this deployment")
+    db = SessionLocal()
+    try:
+        calib_row = (db.query(VisionCalibration)
+                     .filter(VisionCalibration.machine_id == request.machine_id)
+                     .order_by(VisionCalibration.created_at.desc())
+                     .first())
+        if not calib_row:
+            return VisionAlignResponse(success=False, error=(
+                "no calibration saved for machine_id='%s' -- run /api/vision/calibrate first"
+                % request.machine_id))
+
+        H = np.array(json.loads(calib_row.homography_json), dtype=np.float64)
+        calib_report = {"reprojection_error_mm": {"max": calib_row.reprojection_error_mm}}
+        bed_markers = vision_lib.load_bed_markers()
+
+        if request.nominal_x is None or request.nominal_y is None:
+            xs = [m[0] for m in bed_markers.values()]
+            ys = [m[1] for m in bed_markers.values()]
+            nominal = {"x": request.nominal_x if request.nominal_x is not None else (min(xs) + max(xs)) / 2,
+                       "y": request.nominal_y if request.nominal_y is not None else (min(ys) + max(ys)) / 2,
+                       "theta_deg": request.nominal_theta}
+        else:
+            nominal = {"x": request.nominal_x, "y": request.nominal_y, "theta_deg": request.nominal_theta}
+
+        image = _decode_image_bgr(request.image_base64)
+        # Same core math as the desktop CLI path -- see the docstring on
+        # compute_alignment_offset_from_homography() for why this shares
+        # code instead of reimplementing the pixel->mm math here.
+        result = vision_lib.compute_alignment_offset_from_homography(image, nominal, H, calib_report, bed_markers)
+
+        db.add(VisionAlignment(
+            machine_id=request.machine_id, item_uid=request.item_uid,
+            dx_mm=result["dx_mm"], dy_mm=result["dy_mm"], theta_deg=result["theta_deg"],
+            confidence=result["confidence"], nominal_x=nominal["x"], nominal_y=nominal["y"],
+            nominal_theta=nominal["theta_deg"], source="phone",
+        ))
+        db.commit()
+
+        if result["confidence"] < MIN_VISION_CONFIDENCE:
+            return VisionAlignResponse(success=False, error=(
+                "alignment confidence %.2f below minimum %.2f -- refusing to report a reading a "
+                "caller could apply to a job" % (result["confidence"], MIN_VISION_CONFIDENCE)))
+        return VisionAlignResponse(success=True, dx_mm=result["dx_mm"], dy_mm=result["dy_mm"],
+                                    theta_deg=result["theta_deg"], confidence=result["confidence"])
+    except vision_lib.VisionError as e:
+        return VisionAlignResponse(success=False, error=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Alignment failed: {str(e)}")
+    finally:
+        db.close()
+
+@app.get("/api/vision/latest-alignment")
+def vision_latest_alignment(machine_id: str = "default", max_age_seconds: int = 300):
+    """Polled by the desktop app (engraving-app main.js: vision:pullFromPhone)
+    to pick up the most recent phone-submitted alignment. max_age_seconds
+    guards against silently applying a stale reading to a workpiece that
+    isn't on the bed anymore -- default 5 minutes, generous enough for an
+    operator to walk from the phone back to the machine, short enough that
+    a forgotten reading from yesterday can never be picked up by accident."""
+    db = SessionLocal()
+    try:
+        row = (db.query(VisionAlignment)
+               .filter(VisionAlignment.machine_id == machine_id)
+               .order_by(VisionAlignment.created_at.desc())
+               .first())
+        if not row:
+            return {"available": False}
+        age = (datetime.utcnow() - row.created_at).total_seconds()
+        if age > max_age_seconds:
+            return {"available": False, "reason": "stale", "age_seconds": age}
+        return {
+            "available": True,
+            "dx_mm": row.dx_mm, "dy_mm": row.dy_mm, "theta_deg": row.theta_deg,
+            "confidence": row.confidence,
+            "nominal_mm": {"x": row.nominal_x, "y": row.nominal_y, "theta_deg": row.nominal_theta},
+            "item_uid": row.item_uid, "age_seconds": age,
+        }
+    finally:
+        db.close()
 
 # Load models on startup
 @app.on_event("startup")

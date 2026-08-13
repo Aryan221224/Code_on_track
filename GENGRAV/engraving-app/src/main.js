@@ -4,15 +4,81 @@
  */
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const https = require('node:https');
+const http = require('node:http');
 const { GRBLController, GRBL_SETTINGS, LASER_DEFAULTS, BAUD_RATES, CONNECTION_OPTIONS, REALTIME_COMMANDS, GRBL_VERSION } = require('./grbl-controller');
 const db = require('./database');
 const QRCode = require('qrcode');
+const { applyAlignmentOffset } = require('../../shared/gcode-transform');
 
 if (require('electron-squirrel-startup')) app.quit();
 
 const grbl = new GRBLController();
 let mainWindow = null;
 let dbConnected = false;
+
+// ========== Vision Alignment (see VISION_ALIGNMENT.md) ==========
+// Camera-measured workpiece offset from the most recent successful
+// vision:align call. Cleared on connect/disconnect and whenever a new
+// calibration is run, so a stale reading from a previous workpiece can
+// never silently get applied to a different one.
+let lastAlignment = null;
+const VISION_DIR = path.join(__dirname, '../../vision');
+const PYTHON_BIN = process.env.GENGRAV_PYTHON || 'python3';
+
+// Phone-camera alignment (see VISION_ALIGNMENT.md "Phone camera as an
+// alternative capture device"). The phone app POSTs a photo to this same
+// backend's /api/vision/align, which persists the reading -- this pulls
+// the most recent one so it can be applied here exactly like a USB-camera
+// reading from vision:align. Same backend the Flutter app is already
+// configured against (see BACKEND_CONFIG.md); override with
+// GENGRAV_VISION_BACKEND_URL for a local/self-hosted backend.
+const VISION_BACKEND_URL = process.env.GENGRAV_VISION_BACKEND_URL
+  || 'https://railchinh-mobile-backend.onrender.com';
+const VISION_MACHINE_ID = process.env.GENGRAV_MACHINE_ID || 'default';
+
+function httpGetJson(url, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const client = url.startsWith('https') ? https : http;
+    const req = client.get(url, { timeout: timeoutMs }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({ ok: true, data: JSON.parse(body) });
+        } catch (e) {
+          resolve({ ok: false, error: 'invalid JSON from vision backend' });
+        }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'vision backend request timed out' }); });
+  });
+}
+
+function runVisionScript(scriptName, extraArgs = []) {
+  return new Promise((resolve) => {
+    execFile(PYTHON_BIN, [path.join(VISION_DIR, scriptName), ...extraArgs],
+      { cwd: VISION_DIR, timeout: 30000 },
+      (error, stdout, _stderr) => {
+        // Both calibrate.py and align.py always print exactly one JSON
+        // object to stdout, success or failure (see their own docstrings)
+        // -- so a parse failure here means the Python process itself
+        // crashed before reaching its own error handling, which is
+        // reported as-is rather than papered over.
+        const lastLine = (stdout || '').trim().split('\n').pop() || '';
+        try {
+          resolve(JSON.parse(lastLine));
+        } catch (e) {
+          resolve({
+            success: false,
+            error: (error && error.message) || 'vision script produced no parseable output',
+          });
+        }
+      });
+  });
+}
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -125,6 +191,26 @@ ipcMain.handle('grbl:resetEstop', () => grbl.resetEstop().then(() => ({ success:
 ipcMain.handle('grbl:unlock', () => grbl.unlock().then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
 ipcMain.handle('grbl:runGCode', (_, g) => grbl.runGCode(g).then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
 ipcMain.handle('grbl:stop', () => { grbl.stop(); return { success: true }; });
+
+// Run G-code with the most recent vision alignment offset applied first.
+// Kept as a SEPARATE channel from grbl:runGCode (rather than adding a flag
+// to it) so existing callers of runGCode are entirely unaffected, and so
+// this can never fire off a stale/no alignment silently -- it fails closed
+// if there isn't one.
+ipcMain.handle('grbl:runGCodeAligned', (_, g) => {
+  if (!lastAlignment) {
+    return Promise.resolve({ success: false, error: 'no vision alignment available -- run vision:align first' });
+  }
+  const aligned = applyAlignmentOffset(g, {
+    dxMm: lastAlignment.dx_mm,
+    dyMm: lastAlignment.dy_mm,
+    thetaDeg: lastAlignment.theta_deg,
+    pivot: { x: lastAlignment.nominal_mm.x, y: lastAlignment.nominal_mm.y },
+  });
+  return grbl.runGCode(aligned)
+    .then(() => ({ success: true, appliedOffset: lastAlignment }))
+    .catch(e => ({ success: false, error: e.message }));
+});
 
 // ========== GRBL 1.1 Real-time Commands ==========
 ipcMain.handle('grbl:softReset', () => { grbl.softReset(); return { success: true }; });
@@ -263,6 +349,67 @@ ipcMain.handle('api:generateQRMatrix', async (_, { data }) => {
     console.error('QR matrix generation error:', error);
     return { success: false, error: error.message };
   }
+});
+
+// ========== Vision Alignment IPC Handlers ==========
+// See VISION_ALIGNMENT.md for the hardware, calibration procedure and the
+// full design rationale. Both handlers shell out to the vision/ Python CLI
+// tools (OpenCV) rather than using a native Node CV binding -- see that
+// doc's "Why a Python subprocess" section for why that trade was made
+// deliberately, not for lack of a Node option.
+ipcMain.handle('vision:calibrate', async (_, { cameraIndex } = {}) => {
+  const args = cameraIndex !== undefined ? ['--camera', String(cameraIndex)] : [];
+  const result = await runVisionScript('calibrate.py', args);
+  if (result.success) {
+    lastAlignment = null; // a new calibration invalidates any prior alignment reading
+  }
+  return result;
+});
+
+ipcMain.handle('vision:align', async (_, { cameraIndex, nominalX, nominalY, nominalTheta } = {}) => {
+  const args = [];
+  if (cameraIndex !== undefined) args.push('--camera', String(cameraIndex));
+  if (nominalX !== undefined) args.push('--nominal-x', String(nominalX));
+  if (nominalY !== undefined) args.push('--nominal-y', String(nominalY));
+  if (nominalTheta !== undefined) args.push('--nominal-theta', String(nominalTheta));
+  const result = await runVisionScript('align.py', args);
+  lastAlignment = result.success ? result : null;
+  return result;
+});
+
+ipcMain.handle('vision:getLastAlignment', () => ({ alignment: lastAlignment }));
+ipcMain.handle('vision:clearAlignment', () => { lastAlignment = null; return { success: true }; });
+
+// Pull the most recent alignment reading a phone submitted via the mobile
+// app's Vision Alignment page. Fails closed exactly like vision:align:
+// nothing is written to lastAlignment unless the backend actually has a
+// fresh (see max_age_seconds), successful reading.
+ipcMain.handle('vision:pullFromPhone', async (_, { maxAgeSeconds } = {}) => {
+  const age = maxAgeSeconds !== undefined ? maxAgeSeconds : 300;
+  const url = `${VISION_BACKEND_URL}/api/vision/latest-alignment?machine_id=${encodeURIComponent(VISION_MACHINE_ID)}&max_age_seconds=${age}`;
+  const res = await httpGetJson(url);
+  if (!res.ok) {
+    return { success: false, error: `could not reach vision backend: ${res.error}` };
+  }
+  const body = res.data;
+  if (!body.available) {
+    return { success: false, error: body.reason === 'stale'
+      ? `latest phone reading is stale (${Math.round(body.age_seconds)}s old, limit ${age}s)`
+      : 'no phone alignment reading available -- use Vision Alignment on the phone app first' };
+  }
+  const result = {
+    success: true,
+    dx_mm: body.dx_mm,
+    dy_mm: body.dy_mm,
+    theta_deg: body.theta_deg,
+    confidence: body.confidence,
+    nominal_mm: body.nominal_mm,
+    source: 'phone',
+    item_uid: body.item_uid,
+    age_seconds: body.age_seconds,
+  };
+  lastAlignment = result;
+  return result;
 });
 
 console.log('GENGRAV loaded - GRBL 1.1 Controller with Supabase Database');

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/qr_scanner_service.dart';
+import '../pages/vision_alignment_page.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -294,8 +295,31 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                   ),
+                  const SizedBox(height: 12),
+
+                  // Vision Alignment button (see VISION_ALIGNMENT.md) --
+                  // use this phone as the engraver's alignment camera.
+                  SizedBox(
+                    width: double.infinity,
+                    height: 64,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => VisionAlignmentPage(baseUrl: ApiService.baseUrl),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.center_focus_strong),
+                      label: const Text('Vision Alignment', style: TextStyle(fontSize: 16)),
+                      style: OutlinedButton.styleFrom(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
                   const SizedBox(height: 16),
-                  
+
                   // Info text
                   const Text(
                     'Scan a QR code on a railway component to view its details and update status.',
