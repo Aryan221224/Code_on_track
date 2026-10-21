@@ -257,6 +257,40 @@
           </div>
           <span id="progressText">0%</span>
         </div>
+
+        <!-- Batch Engraving: N QR codes from the database, with a delay between each -->
+        <div class="batch-section">
+          <div class="section-header">
+            <h2>🔁 Batch Engrave from Database</h2>
+            <span id="batchPending" class="badge" title="QR codes waiting to be engraved">Pending: --</span>
+          </div>
+          <div class="batch-inputs">
+            <label>
+              <span>Number of QR codes</span>
+              <input type="number" id="batchCount" value="5" min="1" max="10000" step="1">
+            </label>
+            <label>
+              <span>Delay between each (seconds)</span>
+              <input type="number" id="batchDelay" value="10" min="0" max="86400" step="0.5">
+            </label>
+            <label title="How many times a QR code is re-tried after a machine/communication fault">
+              <span>Retries on fault</span>
+              <input type="number" id="batchRetries" value="2" min="0" max="10" step="1">
+            </label>
+          </div>
+          <div class="actions">
+            <button id="batchStartBtn" class="btn success" disabled title="Connect to the laser first">▶ Engrave Batch</button>
+            <button id="batchStopBtn" class="btn danger" disabled>⬛ Stop Batch</button>
+          </div>
+          <div id="batchStatus" class="vision-status">Idle</div>
+          <div id="batchProgressBox" class="progress-box" hidden>
+            <div class="progress-bar">
+              <div id="batchProgressFill" class="fill"></div>
+            </div>
+            <span id="batchProgressText">0 / 0</span>
+          </div>
+          <div id="batchResults" class="batch-results"></div>
+        </div>
       </section>
 
       <!-- Right Panel: Console -->
@@ -411,7 +445,7 @@
       <div class="modal-footer">
         <button id="resetSettingsBtn" class="btn">↻ Reset Defaults</button>
         <button id="cancelSettingsBtn" class="btn">Cancel</button>
-        <button id="saveSettingsBtn" class="btn success">✓ Save Settings</button>
+        <button id="saveEngravingSettingsBtn" class="btn success">✓ Save Settings</button>
       </div>
     </div>
   </div>

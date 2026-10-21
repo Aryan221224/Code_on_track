@@ -9,13 +9,41 @@
  * - Feed and spindle overrides
  * - New error and alarm codes
  */
-const { SerialPort } = require('serialport');
-const { ReadlineParser } = require('@serialport/parser-readline');
 const EventEmitter = require('events');
+
+// Stream tuning (see runGCode)
+const RX_BUFFER_SAFE = 110;        // GRBL RX buffer is 128 bytes; keep a safety margin for clones
+const STREAM_QUEUE_DEPTH = 8;      // lines waiting to be written before the sender pauses
+const NO_DATA_TIMEOUT_MS = 8000;   // GRBL must answer status polls (every 250ms) at least this often
+const IDLE_STALL_MS = 3000;        // GRBL idle yet commands unacknowledged for this long = lost 'ok'
+const JOB_MAX_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Minimal line splitter. Accepts \r\n or \n so a board that only sends \n
+ * (some clones) works too, and has no dependency on serialport parsers.
+ */
+class LineParser extends EventEmitter {
+    constructor() { super(); this.buf = ''; }
+    push(chunk) {
+        this.buf += Buffer.isBuffer(chunk) ? chunk.toString('latin1') : String(chunk);
+        let i;
+        while ((i = this.buf.indexOf('\n')) >= 0) {
+            const line = this.buf.slice(0, i).replace(/\r$/, '').trim();
+            this.buf = this.buf.slice(i + 1);
+            if (line) this.emit('data', line);
+        }
+        if (this.buf.length > 4096) this.buf = '';  // garbage without newline
+    }
+}
+
+function jobError(message, code) {
+    const e = new Error(message);
+    e.code = code;
+    return e;
+}
 
 // GRBL 1.1 specific constants
 const GRBL_VERSION = '1.1';
-const GRBL_RX_BUFFER_SIZE = 127;  // GRBL 1.1 buffer size
 const STATUS_POLL_INTERVAL = 250;
 
 // Supported baud rates (LaserGRBL compatible)
@@ -164,7 +192,6 @@ class GRBLController extends EventEmitter {
         this.machineSubState = null;  // GRBL 1.1 substates (Hold:0, Door:1, etc.)
         this.grblVersion = null;
         this.grblVersionFull = null;
-        this.useSyncMode = true;  // Default to sync mode for GRBL 0.9 compatibility
         this.position = { x: 0, y: 0, z: 0 };
         this.workPosition = { x: 0, y: 0, z: 0 };
         this.workCoordinateOffset = { x: 0, y: 0, z: 0 };  // GRBL 1.1 WCO
@@ -201,14 +228,16 @@ class GRBLController extends EventEmitter {
         this.connectionStartTime = 0;
         this.failedConnections = 0;
 
-        // LaserGRBL-style buffer stuck detection
-        this.lastActivityTime = Date.now();  // Track last RX activity
-        this.grblBufferSize = GRBL_RX_BUFFER_SIZE;  // GRBL's reported buffer size
-        this.bufferStuckCheckInterval = null;
+        // Liveness tracking used by the job watchdog
+        this.lastRxTime = Date.now();      // any line received from GRBL
+        this.lastStatusTime = 0;
+        this.statusCount = 0;              // number of status reports parsed
+        this.expectingReset = false;       // true while WE are soft-resetting GRBL
     }
 
     async listPorts() {
         try {
+            const { SerialPort } = require('serialport');
             const ports = await SerialPort.list();
             // Filter for common laser engraver USB-serial adapters
             const filtered = ports.filter(p => {
@@ -248,6 +277,7 @@ class GRBLController extends EventEmitter {
     // List ALL serial ports without filtering (useful for Arduino/USB devices not recognized by standard filters)
     async listAllPorts() {
         try {
+            const { SerialPort } = require('serialport');
             const ports = await SerialPort.list();
             this.log(`Found ${ports.length} total serial ports (unfiltered)`);
             return ports;
@@ -258,6 +288,29 @@ class GRBLController extends EventEmitter {
         }
     }
 
+    // Creates the underlying serial port. Separate so tests can supply a simulated machine.
+    _createPort({ path, baudRate }) {
+        const { SerialPort } = require('serialport');
+        return new SerialPort({
+            path,
+            baudRate,
+            dataBits: 8,
+            parity: 'none',
+            stopBits: 1,
+            autoOpen: false,
+            // Hardware flow control settings (LaserGRBL style)
+            rtscts: false,
+            xon: false,
+            xoff: false,
+            xany: false
+        });
+    }
+
+    _emitError(e) {
+        // EventEmitter throws on an unhandled 'error' event; never let that kill a job.
+        if (this.listenerCount('error') > 0) this.emit('error', e);
+    }
+
     async connect(portPath, options = {}) {
         if (this.isConnected) await this.disconnect();
 
@@ -265,50 +318,47 @@ class GRBLController extends EventEmitter {
         const dtrOnConnect = options.dtrOnConnect ?? this.connectionOptions.dtrOnConnect;
         const rtsOnConnect = options.rtsOnConnect ?? this.connectionOptions.rtsOnConnect;
         const softResetOnConnect = options.softResetOnConnect ?? this.connectionOptions.softResetOnConnect;
+        const waitForStartup = options.waitForStartup ?? this.connectionOptions.waitForStartup;
 
         this.machineState = MachineState.CONNECTING;
         this.welcomeReceived = false;
         this.connectionStartTime = Date.now();
 
         return new Promise((resolve, reject) => {
+            let settled = false;
+            let connectionTimeout = null;
+            const settle = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(connectionTimeout);
+                fn(value);
+            };
+
             try {
                 this.log(`Connecting to ${portPath} @ ${baudRate} baud...`);
                 this.log(`Options: DTR=${dtrOnConnect}, RTS=${rtsOnConnect}, SoftReset=${softResetOnConnect}`);
 
-                this.port = new SerialPort({
-                    path: portPath,
-                    baudRate: baudRate,
-                    dataBits: 8,
-                    parity: 'none',
-                    stopBits: 1,
-                    autoOpen: false,
-                    // Hardware flow control settings (LaserGRBL style)
-                    rtscts: false,
-                    xon: false,
-                    xoff: false,
-                    xany: false
-                });
-
-                this.parser = this.port.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+                this.port = this._createPort({ path: portPath, baudRate });
+                this.parser = new LineParser();
+                this.port.on('data', (chunk) => this.parser.push(chunk));
                 this.portPath = portPath;
                 this.baudRate = baudRate;
 
                 // Connection timeout
-                const connectionTimeout = setTimeout(() => {
+                connectionTimeout = setTimeout(() => {
                     if (!this.welcomeReceived) {
                         this.log('Connection timeout - no GRBL response');
                         this.failedConnections++;
                         this.disconnect();
-                        reject(new Error('Connection timeout - GRBL not responding. Check baud rate and connections.'));
+                        settle(reject, new Error('Connection timeout - GRBL not responding. Check baud rate and connections.'));
                     }
                 }, this.connectionOptions.connectionTimeout);
 
                 this.port.open((err) => {
                     if (err) {
-                        clearTimeout(connectionTimeout);
                         this.machineState = MachineState.DISCONNECTED;
-                        this.emit('error', err);
-                        reject(err);
+                        this._emitError(err);
+                        settle(reject, err);
                         return;
                     }
 
@@ -351,6 +401,7 @@ class GRBLController extends EventEmitter {
                         this.isConnected = true;
                         this.machineState = MachineState.IDLE;
                         this.failedConnections = 0;
+                        this.lastRxTime = Date.now();
                         this.emit('connected');
                         this.log(`Connected! GRBL ${this.grblVersion || 'detected'}`);
 
@@ -358,14 +409,12 @@ class GRBLController extends EventEmitter {
                         setTimeout(async () => {
                             try {
                                 await this.readSettings();
-                                this.startStatusPolling();
-                                resolve(true);
                             } catch (e) {
                                 this.log(`Settings read warning: ${e.message}`);
-                                this.startStatusPolling();
-                                resolve(true);
                             }
-                        }, this.connectionOptions.waitForStartup);
+                            this.startStatusPolling();
+                            settle(resolve, true);
+                        }, waitForStartup);
                     }
                 });
 
@@ -374,33 +423,23 @@ class GRBLController extends EventEmitter {
                     console.error('SERIAL PORT ERROR:', err);
                     this.isConnected = false;
                     this.machineState = MachineState.DISCONNECTED;
-                    this.emit('error', err);
-                    reject(err);
+                    this._rejectAllPending(jobError(`Serial port error: ${err.message}`, 'DISCONNECTED'));
+                    this._emitError(err);
+                    settle(reject, err);
                 });
 
                 this.port.on('close', () => {
-                    this.log('Port closed unexpectedly');
+                    this.log('Port closed');
                     this.isConnected = false;
                     this.machineState = MachineState.DISCONNECTED;
                     this.stopStatusPolling();
-
-                    // Reject all pending commands to unblock runGCode
-                    const pendingCount = this.sentCommands.length + this.commandQueue.length;
-                    if (pendingCount > 0) {
-                        this.log(`Clearing ${pendingCount} pending commands due to disconnect`);
-                        this.sentCommands.forEach(cmd => cmd.reject(new Error('Port disconnected')));
-                        this.commandQueue.forEach(cmd => cmd.reject(new Error('Port disconnected')));
-                        this.sentCommands = [];
-                        this.commandQueue = [];
-                        this.bufferUsed = 0;
-                    }
-
+                    this._rejectAllPending(jobError('Port disconnected', 'DISCONNECTED'));
                     this.emit('disconnected');
                 });
 
             } catch (e) {
                 this.machineState = MachineState.DISCONNECTED;
-                reject(e);
+                settle(reject, e);
             }
         });
     }
@@ -438,130 +477,87 @@ class GRBLController extends EventEmitter {
         this.connectionOptions = { ...this.connectionOptions, ...options };
     }
 
+    // ========== Command streaming ==========
+    // GRBL "character counting" protocol: lines are written while they fit in
+    // GRBL's 128 byte RX buffer, and every 'ok' / 'error:N' frees the OLDEST
+    // outstanding line. Nothing is ever dropped, skipped or timed out silently:
+    // a line either gets 'ok' or its promise rejects and the job is aborted.
+
+    // Strip comments / whitespace. Empty result means "nothing to send".
+    _clean(cmd) {
+        return String(cmd).replace(/\(.*?\)/g, '').replace(/;.*$/, '').trim();
+    }
+
+    // Queue one line. Resolves on 'ok'. timeoutMs=0 disables the timeout (jobs).
+    _submit(cmd, timeoutMs = 0) {
+        return new Promise((resolve, reject) => {
+            const clean = this._clean(cmd);
+            if (!clean) return resolve(true);
+            const len = clean.length + 1;
+            if (len > RX_BUFFER_SAFE) return reject(new Error(`Line too long (${len} bytes): ${clean.slice(0, 30)}...`));
+
+            const c = { cmd: clean, len, resolve, reject, timestamp: Date.now(), expired: false };
+            if (timeoutMs > 0) {
+                c.timer = setTimeout(() => {
+                    c.expired = true;
+                    // Not yet written: just drop it. Already written: keep it in
+                    // sentCommands so its late 'ok' is still matched to the right line.
+                    const qi = this.commandQueue.indexOf(c);
+                    if (qi !== -1) this.commandQueue.splice(qi, 1);
+                    reject(new Error(`Timeout waiting for GRBL to acknowledge: ${clean.slice(0, 40)}`));
+                }, timeoutMs);
+                const done = () => clearTimeout(c.timer);
+                const res = c.resolve, rej = c.reject;
+                c.resolve = (v) => { done(); res(v); };
+                c.reject = (e) => { done(); rej(e); };
+            }
+            this.commandQueue.push(c);
+            this._pump();
+        });
+    }
+
+    _pump() {
+        if (!this.port?.isOpen) return;
+        while (this.commandQueue.length > 0) {
+            const c = this.commandQueue[0];
+            if (this.bufferUsed + c.len > RX_BUFFER_SAFE) break;
+            this.commandQueue.shift();
+            this.bufferUsed += c.len;
+            this.sentCommands.push(c);
+            this.port.write(c.cmd + '\n');
+            this.emit('tx', c.cmd);
+        }
+    }
+
+    _rejectAllPending(err) {
+        const pending = [...this.sentCommands, ...this.commandQueue];
+        this.sentCommands = [];
+        this.commandQueue = [];
+        this.bufferUsed = 0;
+        pending.forEach(c => c.reject(err));
+        return pending.length;
+    }
+
+    // Fire-and-forget line whose 'ok' must still be accounted for (e.g. '$$').
     sendRaw(cmd) {
         if (!this.isConnected) return false;
-        this.port.write(cmd + '\n');
-        this.emit('tx', cmd);
+        this._submit(cmd, 0).catch(() => { });
         return true;
     }
 
-    // Synchronous send - waits for 'ok' before returning (for GRBL 0.9 compatibility)
-    // This is slower but more reliable for older GRBL versions
-    async sendSync(cmd) {
+    async send(cmd, timeoutMs = 15000) {
         if (!this.isConnected) throw new Error('Not connected');
         if (this.emergencyStop) throw new Error('Emergency stop active');
-
-        return new Promise((resolve, reject) => {
-            const cmdLen = cmd.length + 1;
-            // Short timeout for GRBL 0.9 - if ok is lost, recover quickly
-            const SYNC_TIMEOUT = 5000; // 5 second timeout
-
-            const timeoutId = setTimeout(() => {
-                const sentIdx = this.sentCommands.findIndex(c => c === cmdObj);
-                if (sentIdx !== -1) {
-                    this.sentCommands.splice(sentIdx, 1);
-                    this.bufferUsed -= cmdLen;
-                    this.log(`Sync timeout, continuing: ${cmd.substring(0, 40)}`);
-                }
-                resolve(false); // Resolve to continue
-            }, SYNC_TIMEOUT);
-
-            const cmdObj = {
-                cmd,
-                len: cmdLen,
-                resolve: (val) => { clearTimeout(timeoutId); resolve(val); },
-                reject: (err) => { clearTimeout(timeoutId); reject(err); },
-                timestamp: Date.now()
-            };
-
-            // For sync mode, wait for buffer to clear before sending
-            // This ensures we only have one command in flight at a time
-            if (this.sentCommands.length > 0) {
-                // Queue it and wait
-                this.commandQueue.push(cmdObj);
-                return;
-            }
-
-            // Send immediately
-            this.port.write(cmd + '\n');
-            this.bufferUsed += cmdLen;
-            this.sentCommands.push(cmdObj);
-            this.emit('tx', cmd);
-        });
+        // Interactive commands get a timeout; job lines (runGCode) never do.
+        return this._submit(cmd, timeoutMs);
     }
 
-    async send(cmd) {
-        if (!this.isConnected) throw new Error('Not connected');
-        if (this.emergencyStop) throw new Error('Emergency stop active');
-
-        // Use synchronous mode for GRBL 0.9 (more reliable, slower)
-        // GRBL 0.9 doesn't reliably report buffer state and can drop 'ok' responses
-        const isGrbl09 = this.grblVersion && this.grblVersion.startsWith('0.9');
-        if (isGrbl09 || this.useSyncMode) {
-            return this.sendSync(cmd);
-        }
-
-        // Buffered mode for GRBL 1.1+ (faster, requires reliable serial)
-        const COMMAND_TIMEOUT = 10000; // 10 second timeout (reduced from 30)
-
-        return new Promise((resolve, reject) => {
-            const cmdLen = cmd.length + 1;
-
-            const timeoutId = setTimeout(() => {
-                const queueIdx = this.commandQueue.findIndex(c => c === cmdObj);
-                if (queueIdx !== -1) {
-                    this.commandQueue.splice(queueIdx, 1);
-                    this.log(`Timeout (queued): ${cmd.substring(0, 30)}`);
-                }
-                const sentIdx = this.sentCommands.findIndex(c => c === cmdObj);
-                if (sentIdx !== -1) {
-                    this.sentCommands.splice(sentIdx, 1);
-                    this.bufferUsed -= cmdLen;
-                    this.log(`Timeout (no ok): ${cmd.substring(0, 30)}`);
-                }
-                resolve(false);
-            }, COMMAND_TIMEOUT);
-
-            const cmdObj = {
-                cmd,
-                len: cmdLen,
-                resolve: (val) => { clearTimeout(timeoutId); resolve(val); },
-                reject: (err) => { clearTimeout(timeoutId); reject(err); },
-                timestamp: Date.now()
-            };
-
-            if (this.bufferUsed + cmdLen > GRBL_RX_BUFFER_SIZE) {
-                this.commandQueue.push(cmdObj);
-                return;
-            }
-
-            this.port.write(cmd + '\n');
-            this.bufferUsed += cmdLen;
-            this.sentCommands.push(cmdObj);
-            this.emit('tx', cmd);
-        });
-    }
-
-    processQueue() {
-        while (this.commandQueue.length > 0) {
-            const cmdObj = this.commandQueue[0];
-            const cmdLen = cmdObj.len;
-
-            if (this.bufferUsed + cmdLen <= GRBL_RX_BUFFER_SIZE) {
-                this.commandQueue.shift();
-                cmdObj.timestamp = Date.now();  // Update timestamp when actually sent
-                this.port.write(cmdObj.cmd + '\n');
-                this.bufferUsed += cmdLen;
-                this.sentCommands.push(cmdObj);
-                this.emit('tx', cmdObj.cmd);
-            } else {
-                break;
-            }
-        }
-    }
+    // Kept for API compatibility
+    processQueue() { this._pump(); }
 
     handleResponse(line) {
         if (!line) return;
+        this.lastRxTime = Date.now();
         this.emit('rx', line);
 
         // Status report <...>
@@ -570,48 +566,45 @@ class GRBLController extends EventEmitter {
             return;
         }
 
-        // OK response
+        // OK response: always acknowledges the OLDEST outstanding line
         if (line === 'ok') {
-            if (this.sentCommands.length > 0) {
-                const cmd = this.sentCommands.shift();
+            this.lastOkTime = Date.now();
+            const cmd = this.sentCommands.shift();
+            if (cmd) {
                 this.bufferUsed -= cmd.len;
-                this.completedCommands++;
-                this.lastOkTime = Date.now();  // Track last successful response
-                this.lastActivityTime = Date.now();  // Update for buffer stuck detection
-                cmd.resolve(true);
-                if (this.totalCommands > 0) {
-                    this.emit('progress', {
-                        completed: this.completedCommands,
-                        total: this.totalCommands,
-                        percent: Math.round((this.completedCommands / this.totalCommands) * 100)
-                    });
+                if (!cmd.expired) {
+                    if (this.isRunning) {
+                        this.completedCommands++;
+                        this.emit('progress', {
+                            completed: this.completedCommands,
+                            total: this.totalCommands,
+                            percent: this.totalCommands > 0
+                                ? Math.round((this.completedCommands / this.totalCommands) * 100) : 0
+                        });
+                    }
                 }
+                cmd.resolve(true);
             }
-            this.processQueue();
+            this._pump();
             return;
         }
 
-        // Error response
+        // Error response: the line was REJECTED by GRBL. Never skipped silently:
+        // the owner of the line gets a rejection (a running job aborts).
         if (line.startsWith('error:')) {
             const errorCode = line.match(/error:(\d+)/)?.[1];
             const errorMsg = this.getErrorMessage(errorCode);
             this.log(`Error: ${line} - ${errorMsg}`);
+            this.lastOkTime = Date.now();
 
-            if (this.sentCommands.length > 0) {
-                const cmd = this.sentCommands.shift();
+            const cmd = this.sentCommands.shift();
+            if (cmd) {
                 this.bufferUsed -= cmd.len;
-                this.lastOkTime = Date.now();  // Error is still a response
-                this.lastActivityTime = Date.now();  // Update for buffer stuck detection
-                // Don't reject on errors during G-code run - just log and continue
-                if (this.isRunning) {
-                    this.log(`Skipping error and continuing: ${cmd.cmd}`);
-                    cmd.resolve(false);  // Resolve to continue processing
-                } else {
-                    cmd.reject(new Error(`${line} - ${errorMsg}`));
-                }
+                const e = jobError(`${line} - ${errorMsg} (line: ${cmd.cmd.slice(0, 60)})`, 'GRBL_ERROR');
+                cmd.reject(e);
             }
-            this.emit('error', `${line} - ${errorMsg}`);
-            this.processQueue();
+            this._emitError(`${line} - ${errorMsg}`);
+            this._pump();
             return;
         }
 
@@ -624,6 +617,15 @@ class GRBLController extends EventEmitter {
                 this.log(`GRBL Version: ${this.grblVersion}`);
             }
             this.emit('version', this.grblVersion);
+
+            // Banner after a reset: everything GRBL had buffered is gone.
+            if (/^Grbl\s/i.test(line) && this.welcomeReceived) {
+                this.emit('welcome');
+                if (!this.expectingReset && (this.sentCommands.length > 0 || this.isRunning)) {
+                    this.log('GRBL reset unexpectedly - failing outstanding commands');
+                    this._rejectAllPending(jobError('GRBL reset unexpectedly (power dip or USB glitch)', 'GRBL_RESET'));
+                }
+            }
 
             // Check for known vendors (Ortur, Longer, etc.)
             if (line.toLowerCase().includes('ortur')) {
@@ -658,10 +660,8 @@ class GRBLController extends EventEmitter {
             this.log(`ALARM: ${line} - ${alarmMsg}`);
             this.emit('alarm', { code: alarmCode, message: alarmMsg, raw: line });
 
-            // Log warning but don't auto-stop - let user decide
-            if (this.isRunning) {
-                this.log('WARNING: Alarm during G-code - consider stopping if machine has issue');
-            }
+            // GRBL has halted: whatever it had buffered will never be 'ok'-ed.
+            this._rejectAllPending(jobError(`${line} - ${alarmMsg}`, 'ALARM'));
         }
 
         // Feedback messages [MSG:...]
@@ -739,6 +739,37 @@ class GRBLController extends EventEmitter {
 
     parseStatus(report) {
         const content = report.slice(1, -1);
+
+        // GRBL 0.9 (common on Arduino Uno + CNC shield) reports comma separated:
+        //   <Idle,MPos:0.000,0.000,0.000,WPos:0.000,0.000,0.000>
+        // GRBL 1.1 uses pipes: <Idle|MPos:0.000,0.000,0.000|FS:0,0>
+        if (!content.includes('|')) {
+            this.machineState = content.split(',')[0].split(':')[0];
+            this.machineSubState = null;
+            const triple = (tag) => {
+                const m = content.match(new RegExp(`${tag}:(-?[\\d.]+),(-?[\\d.]+),(-?[\\d.]+)`));
+                return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]), z: parseFloat(m[3]) } : null;
+            };
+            this.position = triple('MPos') || this.position;
+            this.workPosition = triple('WPos') || this.workPosition;
+            this.statusCount++;
+            this.lastStatusTime = Date.now();
+            this.emit('status', {
+                state: this.machineState,
+                subState: null,
+                position: this.position,
+                workPosition: this.workPosition,
+                workCoordinateOffset: this.workCoordinateOffset,
+                feedRate: this.feedRate,
+                spindleSpeed: this.spindleSpeed,
+                overrides: this.overrides,
+                accessories: this.accessories,
+                plannerBuffer: this.plannerBuffer,
+                pins: this.pins
+            });
+            return;
+        }
+
         const parts = content.split('|');
 
         // GRBL 1.1 status can have substates like "Hold:0", "Door:1"
@@ -815,6 +846,8 @@ class GRBLController extends EventEmitter {
                 };
             }
         }
+        this.statusCount++;
+        this.lastStatusTime = Date.now();
         this.emit('status', {
             state: this.machineState,
             subState: this.machineSubState,
@@ -828,57 +861,12 @@ class GRBLController extends EventEmitter {
             plannerBuffer: this.plannerBuffer,
             pins: this.pins
         });
-
-        // LaserGRBL-style: Check for buffer stuck condition after each status report
-        this.handleMissingOK();
     }
 
-    // LaserGRBL pattern: Detect and auto-unlock from buffer stuck condition
-    // A buffer stuck occurs when we have pending commands waiting for 'ok'
-    // but GRBL reports its buffer is free (meaning it processed them but we missed the 'ok')
-    isBufferStuck() {
-        const hasUnackedCommands = this.sentCommands.length > 0 || this.commandQueue.length > 0;
-        const grblSaysBufferFree = this.plannerBuffer.bytes >= GRBL_RX_BUFFER_SIZE - 10;  // Near full = free
-        const noRecentActivity = (Date.now() - this.lastActivityTime) > 5000;  // 5 seconds no activity
-        const isRunningOrIdle = this.machineState === MachineState.RUN || this.machineState === MachineState.IDLE;
-
-        return hasUnackedCommands && grblSaysBufferFree && noRecentActivity && isRunningOrIdle && this.isRunning;
-    }
-
-    handleMissingOK() {
-        if (this.isBufferStuck()) {
-            const pendingCount = this.sentCommands.length;
-            if (pendingCount > 0) {
-                this.log(`Buffer stuck detected! Creating ${pendingCount} fake OKs to unlock (LaserGRBL pattern)`);
-                this.createFakeOKs(pendingCount);
-            }
-        }
-    }
-
-    // Create fake OK responses for stuck commands
-    createFakeOKs(count) {
-        for (let i = 0; i < count && this.sentCommands.length > 0; i++) {
-            const cmd = this.sentCommands.shift();
-            this.bufferUsed -= cmd.len;
-            this.completedCommands++;
-            this.lastActivityTime = Date.now();
-            cmd.resolve(true);  // Resolve as if 'ok' was received
-
-            if (this.totalCommands > 0) {
-                this.emit('progress', {
-                    completed: this.completedCommands,
-                    total: this.totalCommands,
-                    percent: Math.round((this.completedCommands / this.totalCommands) * 100)
-                });
-            }
-        }
-        this.processQueue();  // Process any queued commands
-        this.log(`Auto-unlocked ${count} commands from buffer stuck`);
-    }
 
     startStatusPolling() {
         if (this.pollInterval) return;
-        this.pollInterval = setInterval(() => { if (this.isConnected) this.port.write('?'); }, STATUS_POLL_INTERVAL);
+        this.pollInterval = setInterval(() => { if (this.isConnected && this.port?.isOpen) this.port.write('?'); }, STATUS_POLL_INTERVAL);
     }
 
     stopStatusPolling() {
@@ -904,7 +892,8 @@ class GRBLController extends EventEmitter {
 
     async applyDefaults() {
         for (const [k, v] of Object.entries(LASER_DEFAULTS)) {
-            await this.writeSetting(k, v);
+            // Older GRBL (0.9) doesn't have every setting (e.g. $32): skip those, keep going.
+            try { await this.writeSetting(k, v); } catch (e) { this.log(`Skipped ${k}: ${e.message}`); }
             await this.delay(50);
         }
         this.emit('settings', this.settings);
@@ -927,7 +916,7 @@ class GRBLController extends EventEmitter {
         if (this.settings['$22'] !== 1) {
             this.log('Warning: Homing not enabled ($22=0). Enable with $22=1');
         }
-        await this.send('$H');
+        await this.send('$H', 180000);
         this.log('Homing cycle started');
     }
 
@@ -1022,10 +1011,7 @@ class GRBLController extends EventEmitter {
     async doEmergencyStop() {
         this.emergencyStop = true;
         this.stopRequested = true;
-        this.commandQueue = [];
-        this.sentCommands.forEach(c => c.reject(new Error('E-Stop')));
-        this.sentCommands = [];
-        this.bufferUsed = 0;
+        this._rejectAllPending(jobError('E-Stop', 'ESTOP'));
         this.stopStatusPolling();
         if (this.port?.isOpen) { this.port.write('M5\n'); this.port.write(Buffer.from([0x18])); }
         this.machineState = MachineState.ALARM;
@@ -1043,108 +1029,166 @@ class GRBLController extends EventEmitter {
         this.log('Reset complete');
     }
 
+    // Ask GRBL for a fresh status report (real-time command, not buffered)
+    _requestStatus() {
+        if (this.port?.isOpen) this.port.write('?');
+    }
+
+    // Wait for the next status report newer than `since` (statusCount); false on timeout.
+    async _waitStatus(since, timeoutMs) {
+        const t0 = Date.now();
+        while (this.statusCount <= since) {
+            if (Date.now() - t0 > timeoutMs) return false;
+            if (!this.port?.isOpen) return false;
+            await this.delay(20);
+        }
+        return true;
+    }
+
+    /**
+     * Bring the machine to a known-safe state after a failed/stopped job:
+     * feed hold (so position is kept), soft reset (laser off, buffers flushed),
+     * wait for GRBL's banner. Never throws.
+     */
+    async _abortMotion() {
+        this._rejectAllPending(jobError('Job aborted', 'ABORTED'));
+        if (this.emergencyStop || !this.port?.isOpen) return;
+
+        this.expectingReset = true;
+        try {
+            this.port.write('!');                    // feed hold: stops motion, keeps position
+            const t0 = Date.now();
+            while (Date.now() - t0 < 2500) {
+                const c = this.statusCount;
+                this._requestStatus();
+                if (!(await this._waitStatus(c, 300))) continue;
+                if ([MachineState.HOLD, MachineState.IDLE, MachineState.ALARM].includes(this.machineState)) break;
+            }
+
+            const welcome = new Promise(r => this.once('welcome', r));
+            this.port.write(Buffer.from([REALTIME_COMMANDS.SOFT_RESET]));  // laser off, planner flushed
+            await Promise.race([welcome, this.delay(3000)]);
+            this._rejectAllPending(jobError('Job aborted', 'ABORTED'));
+
+            // Make sure the status reflects the post-reset machine
+            const c = this.statusCount;
+            this._requestStatus();
+            await this._waitStatus(c, 1000);
+            if (this.machineState === MachineState.ALARM) this.alarmActive = true;
+        } catch (e) {
+            this.log(`Abort sequence warning: ${e.message}`);
+        } finally {
+            this.expectingReset = false;
+        }
+    }
+
+    /**
+     * Stream a G-code program and resolve ONLY when the machine has finished
+     * executing it (state Idle, nothing outstanding). Rejects on the first
+     * problem (GRBL error, alarm, lost 'ok', disconnect, stop, e-stop) after
+     * putting the machine in a safe state - it never skips a line and never
+     * reports success for a partly engraved job.
+     */
     async runGCode(gcode) {
+        if (this.isRunning) throw new Error('Another job is already running');
         if (this.emergencyStop) throw new Error('E-Stop active');
         if (this.alarmActive) throw new Error('Alarm active - please unlock first ($X)');
         if (!this.isConnected) throw new Error('Not connected - please connect first');
 
-        const lines = gcode.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith(';'));
+        const lines = String(gcode).split('\n').map(l => this._clean(l)).filter(Boolean);
+        if (lines.length === 0) throw new Error('G-code is empty');
+
         this.totalCommands = lines.length;
         this.completedCommands = 0;
         this.isRunning = true;
-        this.stopRequested = false;  // Reset at start
-        this.userRequestedStop = false;  // Reset user stop flag
-        this.alarmActive = false;    // Reset at start
+        this.stopRequested = false;
+        this.userRequestedStop = false;
         this.lastOkTime = Date.now();
+        this.lastRxTime = Date.now();
+        const startedAt = Date.now();
         this.emit('start', { total: this.totalCommands });
-
         this.log(`Starting G-code execution: ${lines.length} commands`);
 
+        let failure = null;
+        let pending = 0;
+        const fail = (e) => { if (!failure) failure = e instanceof Error ? e : new Error(String(e)); };
+        const interrupted = () => {
+            if (failure) return true;
+            if (this.emergencyStop) fail(jobError('Emergency stop', 'ESTOP'));
+            else if (this.userRequestedStop) fail(jobError('Stopped by operator', 'STOPPED'));
+            else if (!this.isConnected || !this.port?.isOpen) fail(jobError('Connection lost during engraving', 'DISCONNECTED'));
+            else if (this.machineState === MachineState.ALARM) fail(jobError('Machine went into ALARM', 'ALARM'));
+            else if (Date.now() - startedAt > JOB_MAX_MS) fail(jobError('Job exceeded maximum run time', 'TIMEOUT'));
+            return !!failure;
+        };
+
+        const watchdog = setInterval(() => {
+            const now = Date.now();
+            if (now - this.lastRxTime > NO_DATA_TIMEOUT_MS) {
+                fail(jobError(`No data from GRBL for ${Math.round(NO_DATA_TIMEOUT_MS / 1000)}s (check cable / power)`, 'STALL'));
+            } else if (this.sentCommands.length > 0 && this.machineState === MachineState.IDLE
+                && now - this.lastOkTime > IDLE_STALL_MS) {
+                // GRBL has nothing left to do yet we never got an 'ok' for what we sent:
+                // a response was lost. We can't know whether the line ran, so abort cleanly.
+                fail(jobError(`GRBL is idle but did not acknowledge "${this.sentCommands[0].cmd.slice(0, 40)}"`, 'STALL'));
+            }
+        }, 500);
+
         try {
+            // 1. stream every line, in order, with back-pressure
             for (let i = 0; i < lines.length; i++) {
-                // Check connection before each command
-                if (!this.isConnected) {
-                    this.log('Connection lost during engraving!');
-                    this.emit('error', 'Connection lost during engraving');
-                    break;
+                if (interrupted()) break;
+                while (this.commandQueue.length >= STREAM_QUEUE_DEPTH) {
+                    if (interrupted()) break;
+                    await this.delay(2);
                 }
-
-                // Only stop if explicitly requested by user (stop button) or real emergency
-                if (this.userRequestedStop) {
-                    this.log('User requested stop, halting G-code');
-                    break;
-                }
-                if (this.emergencyStop) {
-                    this.log('Emergency stop active, halting G-code');
-                    break;
-                }
-
-                // Send command - this will wait if buffer is full
-                try {
-                    await this.send(lines[i]);
-                } catch (err) {
-                    // If connection error, stop the loop
-                    if (err.message.includes('Not connected') || err.message.includes('disconnected')) {
-                        this.log(`Connection error on command ${i}: ${err.message}`);
-                        this.emit('error', 'Connection lost during engraving');
-                        break;
-                    }
-                    this.log(`Error on command ${i}: ${err.message}`);
-                    // Continue for other errors
-                }
-
-                // Log progress every 100 commands
-                if (i > 0 && i % 100 === 0) {
-                    this.log(`Progress: ${i}/${lines.length} commands sent (${Math.round(i / lines.length * 100)}%)`);
-                }
+                if (interrupted()) break;
+                pending++;
+                this._submit(lines[i], 0).then(() => { pending--; }, (e) => { pending--; fail(e); });
+                if (i > 0 && i % 200 === 0) this.log(`Progress: ${i}/${lines.length} commands sent`);
             }
 
-            // Only wait if still connected
-            if (this.isConnected && this.sentCommands.length > 0) {
-                this.log(`All ${lines.length} commands sent, waiting for ${this.sentCommands.length} pending...`);
+            // 2. every line must be acknowledged
+            while (!interrupted() && pending > 0) await this.delay(5);
 
-                // Wait up to 5 minutes for completion
-                let waitCount = 0;
-                const maxWait = 3000;  // 5 minutes max wait (3000 * 100ms)
-
-                while (this.sentCommands.length > 0 && waitCount < maxWait && this.isConnected) {
-                    if (this.emergencyStop || this.userRequestedStop) {
-                        this.log('Stop during wait');
-                        break;
-                    }
-
-                    await this.delay(100);
-                    waitCount++;
-
-                    // Log every 30 seconds while waiting
-                    if (waitCount % 300 === 0) {
-                        this.log(`Still waiting... ${this.sentCommands.length} commands pending, ${Math.round(waitCount / 10)}s elapsed`);
-                    }
+            // 3. ... and the machine must actually have finished moving
+            let idleReports = 0;
+            while (!interrupted() && idleReports < 2) {
+                const c = this.statusCount;
+                this._requestStatus();
+                if (await this._waitStatus(c, 400)) {
+                    idleReports = this.machineState === MachineState.IDLE ? idleReports + 1 : 0;
                 }
-
-                if (!this.isConnected) {
-                    this.log('Connection lost while waiting for completion');
-                } else if (waitCount >= maxWait) {
-                    this.log('Timeout waiting for commands (5 min) - job may have stalled');
-                } else if (this.sentCommands.length === 0) {
-                    this.log('All commands completed successfully!');
-                }
+                await this.delay(50);
             }
-
-            this.emit('complete');
-        } catch (err) {
-            this.log(`G-code execution error: ${err.message}`);
-            this.emit('error', err.message);
         } finally {
+            clearInterval(watchdog);
+        }
+
+        if (failure) {
+            this.log(`G-code execution FAILED: ${failure.message}`);
+            await this._abortMotion();
             this.isRunning = false;
             this.userRequestedStop = false;
-            this.log('G-code execution finished');
+            this.totalCommands = 0;
+            this._emitError(failure.message);
+            this.emit('job-failed', { message: failure.message, code: failure.code });
+            throw failure;
         }
+
+        this.isRunning = false;
+        this.totalCommands = 0;
+        const seconds = Math.round((Date.now() - startedAt) / 100) / 10;
+        this.log(`All ${lines.length} commands completed successfully in ${seconds}s`);
+        this.emit('complete');
+        return { lines: lines.length, seconds };
     }
 
+    // Stop the running job right now (feed hold immediately; runGCode then resets safely).
     stop() {
         this.stopRequested = true;
-        this.userRequestedStop = true;  // Mark as user-initiated
+        this.userRequestedStop = true;
+        if (this.isRunning && this.port?.isOpen) this.port.write('!');
         this.log('Stop requested by user');
     }
     delay(ms) { return new Promise(r => setTimeout(r, ms)); }
