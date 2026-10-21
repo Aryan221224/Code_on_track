@@ -23,6 +23,28 @@ const DB_CONFIG = {
 let pool = null;
 
 /**
+ * Run fn(client) on a pooled connection and ALWAYS release it, retrying once on
+ * transient connection failures (Supabase pooler drops idle connections).
+ */
+async function withClient(fn) {
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let client;
+    try {
+      client = await initPool().connect();
+      return await fn(client);
+    } catch (error) {
+      lastErr = error;
+      const transient = /terminat|ECONNRESET|ETIMEDOUT|timeout|Connection|EPIPE/i.test(error.message || '');
+      if (!transient) throw error;
+    } finally {
+      if (client) client.release();
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Initialize the database connection pool
  */
 function initPool() {
@@ -42,23 +64,19 @@ function initPool() {
  */
 async function testConnection() {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    // Test query
-    const result = await client.query('SELECT NOW() as current_time, current_database() as database');
-    client.release();
-    
+    const result = await withClient(client =>
+      client.query('SELECT NOW() as current_time, current_database() as database'));
+
     const { current_time, database } = result.rows[0];
-    console.log(`✅ Database connected: ${database} at ${current_time}`);
-    
+    console.log(`Database connected: ${database} at ${current_time}`);
+
     return {
       success: true,
       message: `Connected to ${database}`,
       timestamp: current_time
     };
   } catch (error) {
-    console.error('❌ Database connection failed:', error.message);
+    console.error('Database connection failed:', error.message);
     return {
       success: false,
       error: error.message
@@ -73,12 +91,8 @@ async function testConnection() {
  */
 async function fetchItems(limit = 50) {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    // Query items table - adjust column names based on actual schema
-    const query = `
-      SELECT 
+    const result = await withClient(client => client.query(`
+      SELECT
         uid,
         component_type,
         lot_number,
@@ -88,26 +102,16 @@ async function fetchItems(limit = 50) {
         qr_image_url,
         created_at,
         updated_at
-      FROM items 
-      ORDER BY created_at DESC 
+      FROM items
+      ORDER BY created_at DESC
       LIMIT $1
-    `;
-    
-    const result = await client.query(query, [limit]);
-    client.release();
-    
-    console.log(`📦 Fetched ${result.rows.length} items from database`);
-    
-    return {
-      success: true,
-      items: result.rows
-    };
+    `, [limit]));
+
+    console.log(`Fetched ${result.rows.length} items from database`);
+    return { success: true, items: result.rows };
   } catch (error) {
     console.error('Error fetching items:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
@@ -118,11 +122,8 @@ async function fetchItems(limit = 50) {
  */
 async function fetchItemByUid(uid) {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    const query = `
-      SELECT 
+    const result = await withClient(client => client.query(`
+      SELECT
         uid,
         component_type,
         lot_number,
@@ -132,46 +133,31 @@ async function fetchItemByUid(uid) {
         qr_image_url,
         created_at,
         updated_at
-      FROM items 
+      FROM items
       WHERE uid = $1
-    `;
-    
-    const result = await client.query(query, [uid]);
-    client.release();
-    
+    `, [uid]));
+
     if (result.rows.length === 0) {
-      return {
-        success: false,
-        error: 'Item not found'
-      };
+      return { success: false, error: 'Item not found' };
     }
-    
-    return {
-      success: true,
-      item: result.rows[0]
-    };
+    return { success: true, item: result.rows[0] };
   } catch (error) {
     console.error('Error fetching item:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
 /**
- * Fetch items pending engraving
- * @param {number} limit - Maximum number of items to fetch
+ * Fetch items pending engraving, oldest first so batches are processed in a
+ * stable, predictable order.
+ * @param {number} limit - Exact maximum number of items to fetch
  * @returns {Promise<{success: boolean, items?: Array, error?: string}>}
  */
 async function fetchPendingEngravings(limit = 50) {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    // Fetch items that need engraving (status = 'pending' or 'registered')
-    const query = `
-      SELECT 
+    const n = Math.max(1, Math.min(10000, parseInt(limit, 10) || 1));
+    const result = await withClient(client => client.query(`
+      SELECT
         uid,
         component_type,
         lot_number,
@@ -180,27 +166,28 @@ async function fetchPendingEngravings(limit = 50) {
         current_status,
         qr_image_url,
         created_at
-      FROM items 
+      FROM items
       WHERE current_status IN ('pending', 'registered', 'manufactured')
-      ORDER BY created_at DESC 
+      ORDER BY created_at ASC, uid ASC
       LIMIT $1
-    `;
-    
-    const result = await client.query(query, [limit]);
-    client.release();
-    
-    console.log(`📋 Fetched ${result.rows.length} items pending engraving`);
-    
-    return {
-      success: true,
-      items: result.rows
-    };
+    `, [n]));
+
+    console.log(`Fetched ${result.rows.length} items pending engraving`);
+    return { success: true, items: result.rows };
   } catch (error) {
     console.error('Error fetching pending engravings:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
+  }
+}
+
+/** How many items are waiting to be engraved. */
+async function countPendingEngravings() {
+  try {
+    const result = await withClient(client => client.query(
+      `SELECT COUNT(*)::int AS n FROM items WHERE current_status IN ('pending', 'registered', 'manufactured')`));
+    return { success: true, count: result.rows[0].n };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
@@ -212,38 +199,21 @@ async function fetchPendingEngravings(limit = 50) {
  */
 async function updateItemStatus(uid, status) {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    const query = `
-      UPDATE items 
-      SET current_status = $1, updated_at = NOW() 
+    const result = await withClient(client => client.query(`
+      UPDATE items
+      SET current_status = $1, updated_at = NOW()
       WHERE uid = $2
       RETURNING uid, current_status
-    `;
-    
-    const result = await client.query(query, [status, uid]);
-    client.release();
-    
+    `, [status, uid]));
+
     if (result.rows.length === 0) {
-      return {
-        success: false,
-        error: 'Item not found'
-      };
+      return { success: false, error: 'Item not found' };
     }
-    
-    console.log(`✅ Updated item ${uid} status to: ${status}`);
-    
-    return {
-      success: true,
-      item: result.rows[0]
-    };
+    console.log(`Updated item ${uid} status to: ${status}`);
+    return { success: true, item: result.rows[0] };
   } catch (error) {
     console.error('Error updating item status:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
@@ -254,38 +224,26 @@ async function updateItemStatus(uid, status) {
  */
 async function recordEngraving(engravingData) {
   try {
-    const p = initPool();
-    const client = await p.connect();
-    
-    const { item_uid, operator_id, machine_id, settings, status } = engravingData;
-    
-    const query = `
-      INSERT INTO engravings (item_uid, operator_id, machine_id, settings, status, created_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      RETURNING *
-    `;
-    
-    const result = await client.query(query, [
-      item_uid,
-      operator_id || 'gengrav-operator',
-      machine_id || 'gengrav-laser-1',
-      JSON.stringify(settings || {}),
-      status || 'completed'
-    ]);
-    client.release();
-    
-    console.log(`📝 Recorded engraving for item: ${item_uid}`);
-    
-    return {
-      success: true,
-      engraving: result.rows[0]
+    const { item_uid, operator_id, machine_id, settings, status, job_id, error } = engravingData;
+    const jobId = job_id || `gengrav-${Date.now()}-${String(item_uid || '').slice(0, 12)}`;
+    const payload = {
+      operator_id: operator_id || 'gengrav-operator',
+      machine_id: machine_id || 'gengrav-laser-1',
+      settings: settings || {},
+      error: error || null,
     };
+
+    const result = await withClient(client => client.query(`
+      INSERT INTO engravings (job_id, item_uid, status, raw_payload, orphan, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, FALSE, NOW(), NOW())
+      RETURNING *
+    `, [jobId, item_uid, status || 'completed', JSON.stringify(payload)]));
+
+    console.log(`Recorded engraving for item: ${item_uid}`);
+    return { success: true, engraving: result.rows[0] };
   } catch (error) {
     console.error('Error recording engraving:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    return { success: false, error: error.message };
   }
 }
 
@@ -306,6 +264,7 @@ module.exports = {
   fetchItems,
   fetchItemByUid,
   fetchPendingEngravings,
+  countPendingEngravings,
   updateItemStatus,
   recordEngraving,
   closePool

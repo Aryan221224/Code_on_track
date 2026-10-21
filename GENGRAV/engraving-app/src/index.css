@@ -1004,3 +1004,62 @@ input[type="number"] {
   color: var(--text);
   cursor: pointer;
 }
+/* Batch engraving */
+.batch-section {
+  background: var(--bg3);
+  border-radius: var(--radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.batch-inputs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.batch-inputs label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.batch-inputs input {
+  padding: 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.batch-inputs input:disabled {
+  opacity: 0.6;
+}
+
+.batch-results {
+  max-height: 140px;
+  overflow-y: auto;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+}
+
+.batch-results:empty {
+  display: none;
+}
+
+.batch-result {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.batch-result.engraved { color: var(--success); }
+.batch-result.failed { color: var(--danger); }
+.batch-result.skipped { color: var(--warning); }

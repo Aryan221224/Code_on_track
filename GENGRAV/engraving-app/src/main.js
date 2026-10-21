@@ -11,10 +11,48 @@ const { GRBLController, GRBL_SETTINGS, LASER_DEFAULTS, BAUD_RATES, CONNECTION_OP
 const db = require('./database');
 const QRCode = require('qrcode');
 const { applyAlignmentOffset } = require('../../shared/gcode-transform');
+const { generateQRGCode } = require('./qr-gcode');
+const { BatchEngraver } = require('./batch-engraver');
 
 if (require('electron-squirrel-startup')) app.quit();
 
 const grbl = new GRBLController();
+
+// QR modules (1 = black) for a string; shared by the single-QR UI and the batch engraver.
+function buildQRMatrix(data) {
+  const qrData = QRCode.create(data, { errorCorrectionLevel: 'M' });
+  const modules = qrData.modules;
+  const size = modules.size;
+  const matrix = [];
+  for (let y = 0; y < size; y++) {
+    const row = [];
+    for (let x = 0; x < size; x++) row.push(modules.get(x, y) ? 1 : 0);
+    matrix.push(row);
+  }
+  return matrix;
+}
+
+// Settings / alignment for the batch that is currently running (set by batch:start)
+let batchJob = { settings: {}, applyAlignment: false };
+const batch = new BatchEngraver({
+  grbl,
+  db,
+  generateGCode: (item) => {
+    // never ask for more power than the controller's $30 (max spindle/laser S value)
+    const sMax = Math.min(Number(batchJob.settings.sMax) || 0, grbl.maxPower || 1000);
+    let gcode = generateQRGCode({ matrix: buildQRMatrix(item.uid), uid: item.uid, settings: { ...batchJob.settings, sMax } });
+    if (batchJob.applyAlignment) {
+      if (!lastAlignment) throw new Error('no vision alignment available');
+      gcode = applyAlignmentOffset(gcode, {
+        dxMm: lastAlignment.dx_mm,
+        dyMm: lastAlignment.dy_mm,
+        thetaDeg: lastAlignment.theta_deg,
+        pivot: { x: lastAlignment.nominal_mm.x, y: lastAlignment.nominal_mm.y },
+      });
+    }
+    return gcode;
+  },
+});
 let mainWindow = null;
 let dbConnected = false;
 
@@ -101,6 +139,8 @@ const createWindow = () => {
   grbl.on('version', (v) => mainWindow?.webContents.send('grbl:version', v));
   grbl.on('alarm', (a) => mainWindow?.webContents.send('grbl:alarm', a));
   grbl.on('message', (m) => mainWindow?.webContents.send('grbl:message', m));
+  batch.on('state', (s) => mainWindow?.webContents.send('batch:state', s));
+  batch.on('log', (l) => mainWindow?.webContents.send('batch:log', l));
 
   // Send database connection status to renderer
   mainWindow.webContents.on('did-finish-load', () => {
@@ -186,11 +226,17 @@ ipcMain.handle('grbl:laserTest', (_, { power, duration }) => grbl.laserTest(powe
 ipcMain.handle('grbl:laserFocus', (_, p) => grbl.laserFocus(p).then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
 
 // ========== Control IPC Handlers ==========
-ipcMain.handle('grbl:emergencyStop', () => grbl.doEmergencyStop().then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
+ipcMain.handle('grbl:emergencyStop', () => {
+  if (batch.running) batch.stop();
+  return grbl.doEmergencyStop().then(() => ({ success: true })).catch(e => ({ success: false, error: e.message }));
+});
 ipcMain.handle('grbl:resetEstop', () => grbl.resetEstop().then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
 ipcMain.handle('grbl:unlock', () => grbl.unlock().then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
-ipcMain.handle('grbl:runGCode', (_, g) => grbl.runGCode(g).then(() => ({ success: true })).catch(e => ({ success: false, error: e.message })));
-ipcMain.handle('grbl:stop', () => { grbl.stop(); return { success: true }; });
+ipcMain.handle('grbl:runGCode', (_, g) => {
+  if (batch.running) return Promise.resolve({ success: false, error: 'A batch is running - stop it first' });
+  return grbl.runGCode(g).then((r) => ({ success: true, ...r })).catch(e => ({ success: false, error: e.message }));
+});
+ipcMain.handle('grbl:stop', () => { batch.running ? batch.stop() : grbl.stop(); return { success: true }; });
 
 // Run G-code with the most recent vision alignment offset applied first.
 // Kept as a SEPARATE channel from grbl:runGCode (rather than adding a flag
@@ -207,6 +253,7 @@ ipcMain.handle('grbl:runGCodeAligned', (_, g) => {
     thetaDeg: lastAlignment.theta_deg,
     pivot: { x: lastAlignment.nominal_mm.x, y: lastAlignment.nominal_mm.y },
   });
+  if (batch.running) return Promise.resolve({ success: false, error: 'A batch is running - stop it first' });
   return grbl.runGCode(aligned)
     .then(() => ({ success: true, appliedOffset: lastAlignment }))
     .catch(e => ({ success: false, error: e.message }));
@@ -324,31 +371,47 @@ ipcMain.handle('api:generateQRCode', async (_, { data, size }) => {
 // Generate QR code as matrix (for G-code generation)
 ipcMain.handle('api:generateQRMatrix', async (_, { data }) => {
   try {
-    // Get QR code as a 2D matrix
-    const qrData = await QRCode.create(data, { errorCorrectionLevel: 'M' });
-    const modules = qrData.modules;
-    const size = modules.size;
-
-    // Convert to simple 2D array (1 = black, 0 = white)
-    const matrix = [];
-    for (let y = 0; y < size; y++) {
-      const row = [];
-      for (let x = 0; x < size; x++) {
-        row.push(modules.get(x, y) ? 1 : 0);
-      }
-      matrix.push(row);
-    }
-
-    return {
-      success: true,
-      matrix,
-      size,
-      moduleCount: size
-    };
+    const matrix = buildQRMatrix(data);
+    return { success: true, matrix, size: matrix.length, moduleCount: matrix.length };
   } catch (error) {
     console.error('QR matrix generation error:', error);
     return { success: false, error: error.message };
   }
+});
+
+// Generate G-code for one QR code (same generator the batch engraver uses)
+ipcMain.handle('api:generateQRGCode', async (_, { data, settings }) => {
+  try {
+    return { success: true, gcode: generateQRGCode({ matrix: buildQRMatrix(data), uid: data, settings }) };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// ========== Batch engraving ==========
+// Fetch N pending QR codes from the database and engrave them with a delay between each.
+ipcMain.handle('batch:start', async (_, { count, delaySeconds, maxRetries, settings, applyAlignment } = {}) => {
+  if (batch.running) return { success: false, error: 'A batch is already running' };
+  if (!dbConnected) {
+    const r = await db.testConnection();
+    if (!r.success) return { success: false, error: 'Database not connected' };
+    dbConnected = true;
+  }
+  if (applyAlignment && !lastAlignment) {
+    return { success: false, error: 'no vision alignment available -- run vision:align first' };
+  }
+  batchJob = { settings: settings || {}, applyAlignment: !!applyAlignment };
+  // Runs in the background; progress arrives via batch:state events.
+  batch.start({ count, delaySeconds, maxRetries }).then((r) => {
+    if (r && r.success === false && r.error) mainWindow?.webContents.send('batch:log', { message: r.error, level: 'error' });
+  });
+  return { success: true };
+});
+ipcMain.handle('batch:stop', () => batch.stop());
+ipcMain.handle('batch:getState', () => batch.getState());
+ipcMain.handle('batch:countPending', async () => {
+  if (!dbConnected) return { success: false, error: 'Database not connected' };
+  return await db.countPendingEngravings();
 });
 
 // ========== Vision Alignment IPC Handlers ==========

@@ -12,6 +12,7 @@ let grblVersion = null;
 let loadedImage = null;
 let selectedQRItem = null;
 let qrImageData = null;  // Canvas image data for G-code generation
+let batchRunning = false;  // true while a database batch is engraving
 
 // Default engraving settings (LaserGRBL style)
 const DEFAULT_ENGRAVING_SETTINGS = {
@@ -243,224 +244,24 @@ async function selectQRItem(item, element) {
   }
 }
 
-// QR Matrix data for precise G-code generation
-let qrMatrix = null;
-let qrModuleCount = 0;
-
 /**
- * LaserGRBL-style Line-to-Line G-code Generation
- * This properly scans the QR code pixel by pixel and generates
- * G-code with correct laser ON/OFF segments
+ * Line-to-line QR G-code. Generated in the main process by src/qr-gcode.js,
+ * the exact same generator the batch engraver uses, so a single test engrave
+ * and a batch run always produce identical output.
  */
 async function generateQRGCode() {
-  const { engravingSpeed, laserMode, sMin, sMax, sizeW, sizeH, offsetX, offsetY, quality, direction } = engravingSettings;
-
   if (!selectedQRItem) {
     log('No QR code selected', 'error');
     return null;
   }
-
-  // Get QR matrix for precise engraving
-  try {
-    const matrixResult = await window.api.generateQRMatrix(selectedQRItem.uid);
-    if (matrixResult.success) {
-      qrMatrix = matrixResult.matrix;
-      qrModuleCount = matrixResult.size;
-      log(`QR matrix: ${qrModuleCount}x${qrModuleCount} modules`);
-    } else {
-      log('Failed to get QR matrix', 'error');
-      return null;
-    }
-  } catch (e) {
-    log('Error getting QR matrix: ' + e.message, 'error');
+  const result = await window.api.generateQRGCode(selectedQRItem.uid, engravingSettings);
+  if (!result.success) {
+    log(`Failed to generate QR G-code: ${result.error}`, 'error');
     return null;
   }
-
-  if (!qrMatrix || qrMatrix.length === 0) {
-    log('No QR matrix data available', 'error');
-    return null;
-  }
-
-  // Calculate dimensions
-  const moduleSize = sizeW / qrModuleCount;  // Size of each QR module in mm
-
-  // Use quality setting for lines per mm (higher = better quality, slower)
-  const linesPerMm = quality || 8;  // Default 8 lines/mm if not set
-  const lineSpacing = 1 / linesPerMm;
-  const totalLines = Math.ceil(sizeH / lineSpacing);
-
-  // Determine scan direction (horizontal or vertical)
-  const isHorizontal = (direction || 'horizontal') === 'horizontal';
-
-  const lines = [];
-  lines.push('; GENGRAV QR Code Engraving (LaserGRBL-style Line2Line)');
-  lines.push(`; UID: ${selectedQRItem.uid}`);
-  lines.push(`; Settings: Speed=${engravingSpeed}mm/min, S-MIN=${sMin}, S-MAX=${sMax}`);
-  lines.push(`; Size: ${sizeW}x${sizeH}mm at offset (${offsetX}, ${offsetY})`);
-  lines.push(`; QR Modules: ${qrModuleCount}x${qrModuleCount}`);
-  lines.push(`; Module size: ${moduleSize.toFixed(3)}mm`);
-  lines.push(`; Quality: ${linesPerMm} lines/mm (${lineSpacing.toFixed(3)}mm spacing)`);
-  lines.push(`; Direction: ${isHorizontal ? 'Horizontal' : 'Vertical'}`);
-  lines.push(`; Total lines: ${totalLines}`);
-  lines.push('');
-  lines.push('G21 ; Units: mm');
-  lines.push('G90 ; Absolute positioning');
-
-  // Move to start position with laser OFF
-  lines.push(`G0 X${offsetX.toFixed(3)} Y${offsetY.toFixed(3)} F${engravingSpeed}`);
-
-  // Enable laser mode (M3 for constant power - critical for PWM control)
-  lines.push(`${laserMode} S0 ; Laser ON at zero power`);
-  lines.push('');
-
-  let lineCount = 0;
-
-  if (isHorizontal) {
-    // Horizontal scanning (Y increases, X sweeps)
-    for (let lineIdx = 0; lineIdx < totalLines; lineIdx++) {
-      const y = offsetY + (lineIdx * lineSpacing);
-
-      // Determine which QR module row this line falls into
-      const moduleRow = Math.min(Math.floor((lineIdx * lineSpacing) / moduleSize), qrModuleCount - 1);
-      const rowData = qrMatrix[moduleRow];
-
-      // Alternate scan direction (bidirectional)
-      const leftToRight = (lineIdx % 2 === 0);
-
-      // Build segments for this line
-      const segments = [];
-      let currentSegmentStart = 0;
-      let currentIsBlack = rowData[leftToRight ? 0 : qrModuleCount - 1] === 1;
-
-      // Scan through each module boundary
-      for (let moduleCol = 0; moduleCol <= qrModuleCount; moduleCol++) {
-        // Check if this module is black
-        let isBlack;
-        if (moduleCol >= qrModuleCount) {
-          isBlack = false; // End of line
-        } else {
-          const checkCol = leftToRight ? moduleCol : (qrModuleCount - 1 - moduleCol);
-          isBlack = rowData[checkCol] === 1;
-        }
-
-        // If color changes or end of line, save the segment
-        if (isBlack !== currentIsBlack || moduleCol === qrModuleCount) {
-          segments.push({
-            startModule: currentSegmentStart,
-            endModule: moduleCol,
-            isBlack: currentIsBlack
-          });
-          currentSegmentStart = moduleCol;
-          currentIsBlack = isBlack;
-        }
-      }
-
-      // Generate G-code for this line
-      let currentX = leftToRight ? offsetX : (offsetX + sizeW);
-      let laserIsOn = false;
-
-      for (const seg of segments) {
-        const segStartX = offsetX + (leftToRight ? seg.startModule * moduleSize : sizeW - seg.startModule * moduleSize);
-        const segEndX = offsetX + (leftToRight ? seg.endModule * moduleSize : sizeW - seg.endModule * moduleSize);
-
-        if (seg.isBlack) {
-          // Rapid move to start of segment if needed
-          if (Math.abs(currentX - segStartX) > 0.001) {
-            lines.push(`G0 X${segStartX.toFixed(3)} Y${y.toFixed(3)} S0`);
-            currentX = segStartX;
-          }
-
-          // Engrave the segment with laser ON
-          lines.push(`G1 X${segEndX.toFixed(3)} Y${y.toFixed(3)} F${engravingSpeed} S${sMax}`);
-          currentX = segEndX;
-          laserIsOn = true;
-        } else {
-          // White segment - rapid move
-          if (laserIsOn || Math.abs(currentX - segEndX) > 0.001) {
-            lines.push(`G0 X${segEndX.toFixed(3)} Y${y.toFixed(3)} S0`);
-            currentX = segEndX;
-            laserIsOn = false;
-          }
-        }
-      }
-
-      lineCount++;
-    }
-  } else {
-    // Vertical scanning (X increases, Y sweeps)
-    for (let lineIdx = 0; lineIdx < totalLines; lineIdx++) {
-      const x = offsetX + (lineIdx * lineSpacing);
-
-      // Determine which QR module column this line falls into
-      const moduleCol = Math.min(Math.floor((lineIdx * lineSpacing) / moduleSize), qrModuleCount - 1);
-
-      // Alternate scan direction (bidirectional)
-      const topToBottom = (lineIdx % 2 === 0);
-
-      // Build segments for this column
-      const segments = [];
-      let currentSegmentStart = 0;
-      let currentIsBlack = qrMatrix[topToBottom ? 0 : qrModuleCount - 1][moduleCol] === 1;
-
-      for (let moduleRow = 0; moduleRow <= qrModuleCount; moduleRow++) {
-        let isBlack;
-        if (moduleRow >= qrModuleCount) {
-          isBlack = false;
-        } else {
-          const checkRow = topToBottom ? moduleRow : (qrModuleCount - 1 - moduleRow);
-          isBlack = qrMatrix[checkRow][moduleCol] === 1;
-        }
-
-        if (isBlack !== currentIsBlack || moduleRow === qrModuleCount) {
-          segments.push({
-            startModule: currentSegmentStart,
-            endModule: moduleRow,
-            isBlack: currentIsBlack
-          });
-          currentSegmentStart = moduleRow;
-          currentIsBlack = isBlack;
-        }
-      }
-
-      // Generate G-code for this column
-      let currentY = topToBottom ? offsetY : (offsetY + sizeH);
-      let laserIsOn = false;
-
-      for (const seg of segments) {
-        const segStartY = offsetY + (topToBottom ? seg.startModule * moduleSize : sizeH - seg.startModule * moduleSize);
-        const segEndY = offsetY + (topToBottom ? seg.endModule * moduleSize : sizeH - seg.endModule * moduleSize);
-
-        if (seg.isBlack) {
-          if (Math.abs(currentY - segStartY) > 0.001) {
-            lines.push(`G0 X${x.toFixed(3)} Y${segStartY.toFixed(3)} S0`);
-            currentY = segStartY;
-          }
-
-          lines.push(`G1 X${x.toFixed(3)} Y${segEndY.toFixed(3)} F${engravingSpeed} S${sMax}`);
-          currentY = segEndY;
-          laserIsOn = true;
-        } else {
-          if (laserIsOn || Math.abs(currentY - segEndY) > 0.001) {
-            lines.push(`G0 X${x.toFixed(3)} Y${segEndY.toFixed(3)} S0`);
-            currentY = segEndY;
-            laserIsOn = false;
-          }
-        }
-      }
-
-      lineCount++;
-    }
-  }
-
-  // Finish up
-  lines.push('');
-  lines.push('M5 S0 ; Laser off');
-  lines.push(`G0 X${offsetX.toFixed(3)} Y${offsetY.toFixed(3)} ; Return to start`);
-  lines.push('M2 ; Program end');
-
-  log(`Generated ${lineCount} scan lines, ${lines.length} G-code commands (${isHorizontal ? 'horizontal' : 'vertical'})`);
-
-  return lines.join('\n');
+  const commands = result.gcode.split('\n').filter(l => l && !l.startsWith(';')).length;
+  log(`Generated ${commands} G-code commands for ${selectedQRItem.uid} (${engravingSettings.sizeW}x${engravingSettings.sizeW}mm)`);
+  return result.gcode;
 }
 
 function log(msg, type = 'log') {
@@ -498,6 +299,7 @@ function updateConnectionUI(connected) {
     const el = $(id);
     if (el) el.disabled = !connected;
   });
+  updateBatchControls();
 }
 
 function updateStatus(s) {
@@ -769,7 +571,8 @@ $('cancelSettingsBtn').addEventListener('click', () => {
   $('settingsModal').hidden = true;
 });
 
-$('saveSettingsBtn').addEventListener('click', () => {
+$('saveEngravingSettingsBtn').addEventListener('click', () => {
+  autoSaveSettings();
   $('settingsModal').hidden = true;
   log('Settings saved and closed');
 });
@@ -980,19 +783,29 @@ $('visionPullPhoneBtn').addEventListener('click', async () => {
 
 $('startBtn').addEventListener('click', async () => {
   if (!currentGCode) return;
+  $('startBtn').disabled = true;
   $('stopBtn').disabled = false;
   $('progressBox').hidden = false;
+  let result;
   if ($('visionApplyAlignment').checked) {
     log('Starting with vision alignment applied...');
-    const result = await window.grbl.runGCodeAligned(currentGCode);
-    if (!result.success) {
-      log(`Aligned run failed: ${result.error}`, 'error');
-    }
+    result = await window.grbl.runGCodeAligned(currentGCode);
   } else {
     log('Starting...');
-    await window.grbl.runGCode(currentGCode);
+    result = await window.grbl.runGCode(currentGCode);
+  }
+  if (result.success) {
+    log(`Engraving finished (${result.lines} commands${result.seconds !== undefined ? `, ${result.seconds}s` : ''})`);
+    if (selectedQRItem) {
+      const r = await window.api.updateItemStatus(selectedQRItem.uid, 'engraved');
+      if (r.success) log(`Marked ${selectedQRItem.uid} as engraved`);
+      else log(`Could not mark ${selectedQRItem.uid} as engraved: ${r.error}`, 'warning');
+    }
+  } else {
+    log(`Engraving FAILED: ${result.error}`, 'error');
   }
   $('stopBtn').disabled = true;
+  $('startBtn').disabled = batchRunning;
 });
 
 $('stopBtn').addEventListener('click', async () => { await window.grbl.stop(); log('Stopping...'); });
@@ -1088,7 +901,100 @@ $('gcodeModal').addEventListener('click', (e) => {
 });
 
 // QR Database Controls
-$('refreshQRBtn').addEventListener('click', fetchQRCodes);
+$('refreshQRBtn').addEventListener('click', () => { fetchQRCodes(); refreshPendingCount(); });
+
+// ========== Batch engraving (N QR codes from the database, delay between each) ==========
+function updateBatchControls() {
+  $('batchStartBtn').disabled = !isConnected || batchRunning;
+  $('batchStartBtn').title = isConnected ? '' : 'Connect to the laser first';
+  $('batchStopBtn').disabled = !batchRunning;
+  ['batchCount', 'batchDelay', 'batchRetries'].forEach(id => { $(id).disabled = batchRunning; });
+  $('startBtn').disabled = batchRunning || !currentGCode;
+  $('generateBtn').disabled = batchRunning || !(selectedQRItem || loadedImage);
+}
+
+async function refreshPendingCount() {
+  try {
+    const r = await window.batch.countPending();
+    $('batchPending').textContent = r.success ? `Pending: ${r.count}` : 'Pending: --';
+  } catch (e) {
+    $('batchPending').textContent = 'Pending: --';
+  }
+}
+
+function renderBatchState(s) {
+  batchRunning = !!s.running;
+  updateBatchControls();
+
+  let text = s.message || s.phase;
+  let level = '';
+  if (s.phase === 'engraving') {
+    text = `Engraving ${s.index} of ${s.total}: ${s.currentUid}${s.attempt > 1 ? ` (attempt ${s.attempt})` : ''}`;
+    level = 'warn';
+  } else if (s.phase === 'waiting') {
+    text = `Next QR code in ${s.delayRemaining}s (${s.index} of ${s.total} done) - swap the workpiece now`;
+    level = 'warn';
+  } else if (s.phase === 'recovering') {
+    level = 'warn';
+  } else if (s.phase === 'finished') {
+    level = s.halted || s.failed > 0 ? 'error' : 'ok';
+  }
+  const el = $('batchStatus');
+  el.textContent = text;
+  el.className = 'vision-status' + (level ? ' ' + level : '');
+
+  if (s.total > 0) {
+    const done = s.results.length;
+    $('batchProgressBox').hidden = false;
+    $('batchProgressFill').style.width = `${Math.round((done / s.total) * 100)}%`;
+    $('batchProgressText').textContent = `${done} / ${s.total} done (${s.engraved} engraved${s.failed ? `, ${s.failed} failed` : ''})`;
+  }
+
+  const results = $('batchResults');
+  results.innerHTML = '';
+  s.results.forEach((r, i) => {
+    const row = document.createElement('div');
+    row.className = `batch-result ${r.status}`;
+    const left = document.createElement('span');
+    left.textContent = `${i + 1}. ${r.uid}`;
+    const right = document.createElement('span');
+    right.textContent = r.status === 'engraved'
+      ? `engraved${r.attempts > 1 ? ` (${r.attempts} tries)` : ''}${r.dbSynced === false ? ' - DB NOT UPDATED' : ''}`
+      : `${r.status}: ${r.error || ''}`;
+    row.append(left, right);
+    results.appendChild(row);
+  });
+
+  if (s.phase === 'finished') refreshPendingCount();
+}
+
+$('batchStartBtn').addEventListener('click', async () => {
+  const count = parseInt($('batchCount').value, 10);
+  const delaySeconds = parseFloat($('batchDelay').value);
+  const maxRetries = parseInt($('batchRetries').value, 10);
+  if (!Number.isInteger(count) || count < 1) return log('Enter how many QR codes to engrave (1 or more)', 'error');
+  if (!Number.isFinite(delaySeconds) || delaySeconds < 0) return log('Enter a delay of 0 seconds or more', 'error');
+  if (!Number.isInteger(maxRetries) || maxRetries < 0) return log('Retries must be 0 or more', 'error');
+
+  const r = await window.batch.start({
+    count, delaySeconds, maxRetries,
+    settings: engravingSettings,
+    applyAlignment: $('visionApplyAlignment').checked,
+  });
+  if (!r.success) {
+    log(`Batch not started: ${r.error}`, 'error');
+    return;
+  }
+  log(`Batch started: ${count} QR code(s), ${delaySeconds}s between each`);
+});
+
+$('batchStopBtn').addEventListener('click', async () => {
+  log('Stopping batch...', 'warning');
+  await window.batch.stop();
+});
+
+window.batch.onState(renderBatchState);
+window.batch.onLog(l => log(`[Batch] ${l.message}`, l.level === 'warning' ? 'warning' : l.level === 'error' ? 'error' : 'log'));
 
 // Database status indicator
 function updateDbStatus(connected) {
@@ -1126,6 +1032,7 @@ $('refreshBtn').click();
     if (status.connected) {
       log('📡 Database connected (Supabase)');
       fetchQRCodes();
+      refreshPendingCount();
     } else {
       log('⚠️ Database not connected - retrying...', 'warning');
       // Try to test connection
@@ -1134,6 +1041,7 @@ $('refreshBtn').click();
       if (testResult.success) {
         log('✅ Database connection established!');
         fetchQRCodes();
+        refreshPendingCount();
       }
     }
   } catch (e) {

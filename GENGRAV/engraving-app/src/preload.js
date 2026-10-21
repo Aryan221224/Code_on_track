@@ -111,10 +111,21 @@ contextBridge.exposeInMainWorld('api', {
     // QR Code generation
     generateQRCode: (data, size) => ipcRenderer.invoke('api:generateQRCode', { data, size }),
     generateQRMatrix: (data) => ipcRenderer.invoke('api:generateQRMatrix', { data }),
+    generateQRGCode: (data, settings) => ipcRenderer.invoke('api:generateQRGCode', { data, settings }),
 
     // Engraving operations
     updateItemStatus: (uid, status) => ipcRenderer.invoke('api:updateItemStatus', { uid, status }),
     recordEngraving: (data) => ipcRenderer.invoke('api:recordEngraving', data)
+});
+
+// Batch engraving: fetch N pending QR codes and engrave them with a delay between each.
+contextBridge.exposeInMainWorld('batch', {
+    start: (opts) => ipcRenderer.invoke('batch:start', opts),
+    stop: () => ipcRenderer.invoke('batch:stop'),
+    getState: () => ipcRenderer.invoke('batch:getState'),
+    countPending: () => ipcRenderer.invoke('batch:countPending'),
+    onState: (cb) => ipcRenderer.on('batch:state', (_, s) => cb(s)),
+    onLog: (cb) => ipcRenderer.on('batch:log', (_, l) => cb(l))
 });
 
 // Vision Alignment (see VISION_ALIGNMENT.md) -- camera-based workpiece
